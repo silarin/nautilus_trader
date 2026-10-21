@@ -38,7 +38,7 @@ use nautilus_common::{
 };
 use nautilus_core::UUID4;
 use nautilus_model::{
-    identifiers::{ClientId, ClientOrderId},
+    identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, TradeId},
     reports::{FillReport, PositionStatusReport},
 };
 
@@ -262,6 +262,7 @@ impl LiveNode {
                             PositionFillReportResult {
                                 position_result,
                                 reports: result.reports,
+                                sources: Box::new(result.sources),
                                 successful_keys: result.successful_keys,
                             },
                         ))
@@ -308,6 +309,7 @@ impl LiveNode {
         let PositionFillReportResult {
             mut position_result,
             mut reports,
+            sources,
             successful_keys,
         } = result;
         let mut venue_reports = IndexMap::new();
@@ -323,6 +325,46 @@ impl LiveNode {
         let mut dispatches = 0;
 
         for key in successful_keys {
+            let key_reports = reports.shift_remove(&key).unwrap_or_default();
+
+            for report in &key_reports {
+                let client_id = sources
+                    .get(&(report.account_id, report.instrument_id, report.trade_id))
+                    .copied()
+                    .or_else(|| {
+                        self.kernel.exec_engine.borrow().order_query_fill_client(
+                            report.account_id,
+                            report.instrument_id,
+                            report.client_order_id,
+                        )
+                    });
+
+                if client_id.is_some_and(|id| {
+                    self.kernel
+                        .exec_engine
+                        .borrow()
+                        .get_client(&id)
+                        .is_some_and(|client| {
+                            client.requires_order_query_fills(report.instrument_id)
+                        })
+                }) {
+                    self.exec_manager
+                        .retain_standalone_fill_report(report, client_id, false);
+                }
+            }
+
+            if nautilus_execution::reconciliation::fills_have_ambiguous_position_order(
+                &self.kernel.cache.borrow(),
+                &key_reports,
+                false,
+            ) && self.exec_manager.position_fill_recovery_pending(&key)
+            {
+                log::warn!(
+                    "Deferring unordered position fill history pending complete native queries"
+                );
+                continue;
+            }
+
             if !self
                 .exec_manager
                 .position_report_check_is_current(&position_result.check, &key)
@@ -343,7 +385,7 @@ impl LiveNode {
             let mut applied_fill = false;
             let mut blocked = false;
 
-            for mut report in reports.shift_remove(&key).unwrap_or_default() {
+            for mut report in key_reports {
                 if self.exec_manager.position_activity_revision(&key) != expected_revision {
                     blocked = true;
                     break;
@@ -611,6 +653,7 @@ pub(super) async fn request_position_fill_reports(
     let mut reports_by_key: IndexMap<InstrumentAccountKey, Vec<FillReport>> = IndexMap::new();
     let mut queried_keys = IndexSet::new();
     let mut failed_keys = IndexSet::new();
+    let mut sources = IndexMap::new();
 
     for query in queries {
         queried_keys.insert(query.key);
@@ -629,6 +672,7 @@ pub(super) async fn request_position_fill_reports(
             continue;
         };
 
+        let record_time_window = client.fill_query_uses_record_time(query.key.0);
         let command = query.command;
         match client.generate_fill_reports(command.clone()).await {
             Ok(reports)
@@ -636,11 +680,18 @@ pub(super) async fn request_position_fill_reports(
                     .iter()
                     .all(|report| fill_report_matches_query_scope(report, query.key, &command)) =>
             {
-                reports_by_key.entry(query.key).or_default().extend(
-                    reports
-                        .into_iter()
-                        .filter(|report| fill_report_in_query_window(report, &command)),
-                );
+                for report in reports.into_iter().filter(|report| {
+                    record_time_window || fill_report_in_query_window(report, &command)
+                }) {
+                    let key = (report.account_id, report.instrument_id, report.trade_id);
+                    if sources
+                        .insert(key, query.client_id)
+                        .is_some_and(|previous| previous != query.client_id)
+                    {
+                        failed_keys.insert(query.key);
+                    }
+                    reports_by_key.entry(query.key).or_default().push(report);
+                }
             }
             Ok(_) => {
                 failed_keys.insert(query.key);
@@ -703,6 +754,7 @@ pub(super) async fn request_position_fill_reports(
 
     PositionFillReportQueryResult {
         reports: reports_by_key,
+        sources,
         successful_keys,
     }
 }
@@ -848,6 +900,7 @@ pub(super) enum PositionReportTaskResult {
 pub(super) struct PositionFillReportResult {
     pub(super) position_result: PositionReportResult,
     pub(super) reports: IndexMap<InstrumentAccountKey, Vec<FillReport>>,
+    pub(super) sources: Box<IndexMap<(AccountId, InstrumentId, TradeId), ClientId>>,
     pub(super) successful_keys: IndexSet<InstrumentAccountKey>,
 }
 
@@ -860,6 +913,7 @@ struct PositionReportQueryResult {
 /// Fill reports grouped by keys with complete, consistent query results.
 pub(super) struct PositionFillReportQueryResult {
     pub(super) reports: IndexMap<InstrumentAccountKey, Vec<FillReport>>,
+    pub(super) sources: IndexMap<(AccountId, InstrumentId, TradeId), ClientId>,
     pub(super) successful_keys: IndexSet<InstrumentAccountKey>,
 }
 

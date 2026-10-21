@@ -64,6 +64,7 @@ static PORTFOLIO_ORDER_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static SYSTEM_SHUTDOWN_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static SUBMISSION_RECOVERY_EXHAUSTED_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_ORDER_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static RECONCILIATION_RAW_ORDER_QUERY_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_FILL_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_POSITION_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 
@@ -312,6 +313,18 @@ macro_rules! define_switchboard {
                     .get_or_init(|| "reconciliation.raw.OrderStatusReport".into())
             }
 
+            /// Returns the topic for observed order-query fill obligations before projection.
+            #[must_use]
+            pub fn reconciliation_raw_order_query_topic() -> MStr<Topic> {
+                *RECONCILIATION_RAW_ORDER_QUERY_TOPIC
+                    .get_or_init(|| "reconciliation.raw.OrderQueryWithFills".into())
+            }
+
+            /// Pub/sub topic retaining standalone authoritative fill recovery obligations.
+            pub fn reconciliation_fill_evidence_topic() -> MStr<Topic> {
+                "reconciliation.evidence.FillReport".into()
+            }
+
             /// Pub/sub topic carrying raw `FillReport`s that arrived from a
             /// venue client, published by the execution engine at the top of
             /// reconciliation before any state mutation.
@@ -507,6 +520,10 @@ define_switchboard! {
     order_fill_declined_topics: InstrumentId,
     get_order_fill_declined_topic(instrument_id: InstrumentId) -> instrument_id,
     "events.order_fill_declined.{}", instrument_id;
+
+    order_fill_order_only_topics: InstrumentId,
+    get_order_fill_order_only_topic(instrument_id: InstrumentId) -> instrument_id,
+    "events.order_fill_order_only.{}", instrument_id;
 
     event_order_topics: StrategyId,
     get_event_order_topic(strategy_id: StrategyId) -> strategy_id,
@@ -724,6 +741,7 @@ define_wrappers! {
     get_order_filled_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_fill_voided_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_order_fill_declined_topic(instrument_id: InstrumentId) -> MStr<Topic>,
+    get_order_fill_order_only_topic(instrument_id: InstrumentId) -> MStr<Topic>,
     get_snapshot_order_topic(client_order_id: ClientOrderId) -> MStr<Topic>,
     get_snapshot_position_topic(position_id: PositionId) -> MStr<Topic>,
     get_event_order_topic(strategy_id: StrategyId) -> MStr<Topic>,
@@ -1062,6 +1080,10 @@ mod tests {
         MessagingSwitchboard::get_order_filled_topic as OrderEventTopicFn,
         "events.order_filled.ESZ24.XCME",
     )]
+    #[case::order_only(
+        MessagingSwitchboard::get_order_fill_order_only_topic as OrderEventTopicFn,
+        "events.order_fill_order_only.ESZ24.XCME",
+    )]
     #[case::fill_voided(
         MessagingSwitchboard::get_order_fill_voided_topic as OrderEventTopicFn,
         "events.order_fill_voided.ESZ24.XCME",
@@ -1085,6 +1107,7 @@ mod tests {
     #[case::cancel_rejected(MessagingSwitchboard::get_order_cancel_rejected_topic as OrderEventTopicFn)]
     #[case::canceled(MessagingSwitchboard::get_order_canceled_topic as OrderEventTopicFn)]
     #[case::filled(MessagingSwitchboard::get_order_filled_topic as OrderEventTopicFn)]
+    #[case::order_only(MessagingSwitchboard::get_order_fill_order_only_topic as OrderEventTopicFn)]
     #[case::fill_voided(MessagingSwitchboard::get_order_fill_voided_topic as OrderEventTopicFn)]
     fn test_order_event_topic_does_not_match_strategy_order_pattern(
         mut switchboard: MessagingSwitchboard,

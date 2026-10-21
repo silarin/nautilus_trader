@@ -338,6 +338,23 @@ pub trait ExecutionClient {
         Ok(())
     }
 
+    /// Whether this instrument's status queries recover missing fills through [`Self::query_order`].
+    ///
+    /// Clients opting in must emit `ExecutionReport::OrderQueryWithFills` with complete,
+    /// authoritative fills, or an empty fill list when recovery is incomplete. Status-only
+    /// startup, bulk and targeted responses must never authorize inferred fills for these clients.
+    fn requires_order_query_fills(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
+    /// Whether this client's fill query bounds select venue record time rather than execution time.
+    ///
+    /// Opted-in clients must validate the requested record-time window before returning reports.
+    /// Consumers must retain `FillReport::ts_event` as execution time without filtering it again.
+    fn fill_query_uses_record_time(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
     /// Queries the status of an order.
     ///
     /// # Errors

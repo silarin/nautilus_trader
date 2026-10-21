@@ -1901,6 +1901,7 @@ mod serial_tests {
         snapshot.avg_px = Some(Decimal::from_str("1.6666666666666666666666666667").unwrap());
         snapshot.slippage = Some(Decimal::from_str("0.0000000000000000000000000001").unwrap());
 
+        snapshot.commissions = vec![Money::from_str_exact("0.011995693 USDT").unwrap()];
         pg_cache.add_order_snapshot(&snapshot).unwrap();
 
         wait_until(
@@ -1918,6 +1919,7 @@ mod serial_tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(loaded.commissions, snapshot.commissions);
         assert_eq!(loaded.avg_px, snapshot.avg_px);
         assert_eq!(loaded.slippage, snapshot.slippage);
         reset_test_database(&pg_cache).await;
@@ -2158,7 +2160,7 @@ mod serial_tests {
             .side(OrderSide::Buy)
             .quantity(Quantity::from("1.0"))
             .build();
-        let OrderEventAny::Filled(opening_fill) = TestOrderEventStubs::filled(
+        let OrderEventAny::Filled(mut opening_fill) = TestOrderEventStubs::filled(
             &opening_order,
             &instrument,
             Some(TradeId::new("T-PG-ROUTINE-SNAPSHOT-1")),
@@ -2172,6 +2174,8 @@ mod serial_tests {
         ) else {
             unreachable!();
         };
+        let fee = Money::from_str_exact("0.011995693 USDT").unwrap();
+        opening_fill.commission = Some(fee);
         let mut position = Position::new(&instrument, opening_fill);
 
         pg_cache.add_position(&position).unwrap();
@@ -2214,6 +2218,8 @@ mod serial_tests {
             .unwrap()
             .expect("position should replay fills newer than its routine snapshot");
 
+        assert_eq!(snapshot.commissions, vec![fee]);
+        assert_eq!(snapshot.realized_pnl, Some(-fee));
         assert_eq!(snapshot.quantity, Quantity::from("1.0"));
         assert!(snapshot.replay_state.is_none());
         assert_eq!(loaded.quantity, Quantity::from("1.5"));

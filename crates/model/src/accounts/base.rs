@@ -850,6 +850,24 @@ mod tests {
     }
 
     #[rstest]
+    fn test_update_commissions_preserves_fractional_currency_units() {
+        use crate::{
+            events::account::stubs::cash_account_state,
+            types::{Currency, Money},
+        };
+
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let usd = Currency::USD();
+
+        // Exact native fee units must not be rounded to the currency display precision.
+        account.update_commissions(Money::from_raw(1, usd));
+
+        assert_eq!(account.commission(&usd), Some(Money::from_raw(1, usd)));
+        account.update_commissions(Money::from_raw(-2, usd));
+        assert_eq!(account.commission(&usd), Some(Money::from_raw(-1, usd)));
+    }
+
+    #[rstest]
     fn test_commissions_returns_every_currency() {
         let mut account = BaseAccount::new(cash_account_state(), true);
         account.update_commissions(Money::from("2.50 USD"));

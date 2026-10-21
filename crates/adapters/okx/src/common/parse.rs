@@ -19,6 +19,10 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use jiff::Timestamp;
+use nautilus_common::messages::execution::{
+    CommissionBasis, CumulativeCommissionConstraint, IncompleteFillReport, OrderFeeEvidence,
+    OrderFeeOrigin,
+};
 pub use nautilus_core::serialization::{
     deserialize_empty_string_as_none, deserialize_empty_ustr_as_none,
     deserialize_optional_string_to_u64, deserialize_string_to_u64,
@@ -431,20 +435,295 @@ pub fn parse_quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
     Quantity::from_decimal_dp(decimal, precision).map_err(Into::into)
 }
 
+// Numeric syntax which exceeds Decimal remains a permanent recovery constraint;
+// absent or nonnumeric fields may still be supplied by fresh authoritative history.
+pub(crate) fn parse_incomplete_decimal(
+    value: &str,
+    unrepresentable_values: &mut bool,
+) -> Option<Decimal> {
+    let value = value.trim();
+
+    match Decimal::from_str_exact(value) {
+        Ok(decimal) => Some(decimal),
+        Err(_) => {
+            let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+            let mut parts = unsigned.split(['e', 'E']);
+            let mantissa = parts.next().unwrap_or_default();
+            let exponent = parts.next();
+            let numeric_mantissa = mantissa.bytes().any(|b| b.is_ascii_digit())
+                && mantissa
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'_'))
+                && mantissa.bytes().filter(|b| *b == b'.').count() <= 1;
+            let numeric_exponent = exponent.is_none_or(|value| {
+                let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+                digits.bytes().any(|b| b.is_ascii_digit())
+                    && digits.bytes().all(|b| b.is_ascii_digit() || b == b'_')
+            });
+            *unrepresentable_values |=
+                numeric_mantissa && numeric_exponent && parts.next().is_none();
+            None
+        }
+    }
+}
+
+/// Raw cumulative fields retain independent facts even when status parsing fails.
+pub(crate) struct CumulativeFeeFields<'a> {
+    pub instrument_type: OKXInstrumentType,
+    pub category: OKXOrderCategory,
+    pub side: OKXSide,
+    pub position_side: OKXPositionSide,
+    pub venue_order_id: &'a str,
+    pub client_order_id: Option<ClientOrderId>,
+    pub quantity: &'a str,
+    pub fee: Option<&'a str>,
+    pub fee_currency: &'a str,
+    pub rebate: Option<&'a str>,
+    pub rebate_currency: Option<&'a str>,
+    pub trade_id: &'a str,
+    pub fill_time: u64,
+    pub update_time: u64,
+}
+
+// Liquidation/ADL order information uses tradeId=0; actual fill history uses negative IDs.
+// The placeholder cannot anchor either a cumulative fee or an individual execution.
+pub(crate) fn parse_order_trade_id(value: &str) -> Option<TradeId> {
+    match value.trim() {
+        "" | "0" => None,
+        _ => Some(TradeId::from(value)),
+    }
+}
+
+pub(crate) fn is_order_trade_id_placeholder(value: &str, category: OKXOrderCategory) -> bool {
+    value.trim() == "0"
+        && matches!(
+            category,
+            OKXOrderCategory::FullLiquidation
+                | OKXOrderCategory::PartialLiquidation
+                | OKXOrderCategory::Adl
+        )
+}
+
+pub(crate) fn parse_order_fee_evidence(
+    fields: &CumulativeFeeFields<'_>,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    origin: OrderFeeOrigin,
+    ts_init: UnixNanos,
+) -> Option<OrderFeeEvidence> {
+    let mut unrepresentable_values = false;
+    let quantity = parse_incomplete_decimal(fields.quantity, &mut unrepresentable_values);
+    let fee = fields
+        .fee
+        .and_then(|value| parse_incomplete_decimal(value, &mut unrepresentable_values))
+        .map(|value| -value);
+    let rebate = fields
+        .rebate
+        .and_then(|value| parse_incomplete_decimal(value, &mut unrepresentable_values))
+        .map(|value| -value);
+
+    if quantity == Some(Decimal::ZERO)
+        && fields.trade_id.is_empty()
+        && fields.fill_time == 0
+        && fee.is_none_or(|value| value.is_zero())
+        && rebate.is_none_or(|value| value.is_zero())
+        && !unrepresentable_values
+    {
+        return None;
+    }
+    let cash = matches!(
+        fields.instrument_type,
+        OKXInstrumentType::Spot | OKXInstrumentType::Margin
+    );
+    let basis = match fields.instrument_type {
+        OKXInstrumentType::Spot | OKXInstrumentType::Margin => {
+            // Liquidation/ADL executions have no maker/taker classification and
+            // cannot use the cash maker-sell exception to the charges-only fee.
+            let system_order = matches!(
+                fields.category,
+                OKXOrderCategory::FullLiquidation
+                    | OKXOrderCategory::PartialLiquidation
+                    | OKXOrderCategory::Adl
+            );
+            Some(if fields.side == OKXSide::Sell && !system_order {
+                CommissionBasis::UniformLiquidity
+            } else {
+                CommissionBasis::ChargesOnly
+            })
+        }
+        OKXInstrumentType::Swap | OKXInstrumentType::Futures | OKXInstrumentType::Option => {
+            Some(CommissionBasis::Net)
+        }
+        _ => None,
+    };
+    let currency =
+        |raw: &str| (!raw.trim().is_empty()).then(|| Currency::get_or_create_crypto(raw.trim()));
+    let mut constraints = vec![CumulativeCommissionConstraint {
+        basis,
+        amount: fee,
+        currency: currency(fields.fee_currency),
+    }];
+
+    // Cash charges and rebates are independent buckets. An omitted rebate is
+    // unknown, not proof that the fee bucket contains the entire commission.
+    if cash {
+        constraints.push(CumulativeCommissionConstraint {
+            basis: Some(CommissionBasis::RebatesOnly),
+            amount: rebate,
+            currency: fields.rebate_currency.and_then(currency),
+        });
+    }
+    let requires_fresh_query = quantity.is_none()
+        || fee.is_none()
+        || constraints
+            .iter()
+            .any(|constraint| constraint.amount.is_none())
+        || fields.update_time == 0;
+    Some(OrderFeeEvidence {
+        account_id,
+        instrument_id,
+        venue_order_id: VenueOrderId::from(fields.venue_order_id),
+        client_order_id: fields.client_order_id,
+        venue_position_id: venue_position_id(instrument_id, fields.position_side),
+        order_side: fields.side.into(),
+        boundary_quantity: quantity,
+        boundary_time: (fields.update_time > 0)
+            .then(|| parse_millisecond_timestamp(fields.update_time)),
+        anchor_trade_id: parse_order_trade_id(fields.trade_id),
+        anchor_trade_time: (fields.fill_time > 0)
+            .then(|| parse_millisecond_timestamp(fields.fill_time)),
+        origin,
+        constraints,
+        unrepresentable_values,
+        requires_fresh_query,
+        ts_init,
+    })
+}
+
+pub(crate) fn parse_rest_order_fee_evidence(
+    order: &OKXOrderHistory,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> Option<OrderFeeEvidence> {
+    parse_order_fee_evidence(
+        &CumulativeFeeFields {
+            instrument_type: order.inst_type,
+            category: order.category,
+            side: order.side,
+            position_side: order.pos_side,
+            venue_order_id: order.ord_id.as_str(),
+            client_order_id: parse_parent_client_order_id(
+                order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
+                order.cl_ord_id.as_str(),
+            ),
+            quantity: &order.acc_fill_sz,
+            fee: Some(&order.fee),
+            fee_currency: &order.fee_ccy,
+            rebate: order.rebate.as_deref(),
+            rebate_currency: order.rebate_ccy.as_deref(),
+            trade_id: order.trade_id.as_str(),
+            fill_time: order.fill_time,
+            update_time: order.u_time,
+        },
+        account_id,
+        instrument_id,
+        OrderFeeOrigin::Query,
+        ts_init,
+    )
+}
+
+pub(crate) fn parse_incomplete_order_fill(
+    order: &OKXOrderHistory,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    ts_init: UnixNanos,
+) -> IncompleteFillReport {
+    let mut unrepresentable_values = false;
+    let last_qty = parse_incomplete_decimal(&order.fill_sz, &mut unrepresentable_values);
+    let last_px = parse_incomplete_decimal(&order.fill_px, &mut unrepresentable_values);
+    IncompleteFillReport {
+        account_id,
+        instrument_id,
+        venue_order_id: VenueOrderId::from(order.ord_id.as_str()),
+        client_order_id: parse_parent_client_order_id(
+            order.algo_cl_ord_id.as_ref().map(Ustr::as_str),
+            order.cl_ord_id.as_str(),
+        ),
+        trade_id: parse_order_trade_id(order.trade_id.as_str()),
+        trade_id_placeholder: is_order_trade_id_placeholder(
+            order.trade_id.as_str(),
+            order.category,
+        ),
+        order_side: order.side.into(),
+        last_qty,
+        last_px,
+        // REST order fee is cumulative, so it cannot serve as an individual fee.
+        commission_amount: None,
+        commission_currency: None,
+        unrepresentable_values,
+        requires_fresh_query: true,
+        order_snapshot: None,
+        liquidity_side: None,
+        venue_position_id: venue_position_id(instrument_id, order.pos_side),
+        ts_event: (order.fill_time > 0).then(|| parse_millisecond_timestamp(order.fill_time)),
+        ts_init,
+    }
+}
+
+/// Retains independently supplied last-execution facts from a successful order query.
+pub(crate) fn parse_order_fill_observation(
+    order: &OKXOrderHistory,
+    snapshot: &OrderStatusReport,
+) -> Option<IncompleteFillReport> {
+    let mut observation = parse_incomplete_order_fill(
+        order,
+        snapshot.account_id,
+        snapshot.instrument_id,
+        snapshot.ts_init,
+    );
+    let has_execution = observation.trade_id.is_some()
+        || observation.last_qty.is_some_and(|qty| !qty.is_zero())
+        || observation.last_px.is_some_and(|px| !px.is_zero())
+        || observation.ts_event.is_some()
+        || observation.unrepresentable_values;
+    let malformed = [&order.fill_sz, &order.fill_px]
+        .iter()
+        .any(|value| !value.trim().is_empty() && Decimal::from_str_exact(value.trim()).is_err());
+    observation.requires_fresh_query = malformed;
+    observation.order_snapshot = Some(Box::new(snapshot.clone()));
+    observation.last_qty = observation.last_qty.filter(|qty| !qty.is_zero());
+    observation.last_px = observation.last_px.filter(|px| !px.is_zero());
+    (has_execution || malformed).then_some(observation)
+}
+
+pub(crate) fn parse_cumulative_fill_quantity(
+    value: &str,
+    precision: u8,
+) -> anyhow::Result<Quantity> {
+    let decimal = Decimal::from_str_exact(value)?;
+    let quantity = Quantity::from_decimal_dp(decimal, precision)?;
+    anyhow::ensure!(
+        quantity.as_decimal() == decimal,
+        "Cumulative fill quantity is not exactly representable"
+    );
+    Ok(quantity)
+}
+
 /// Converts a textual fee amount into a [`Money`] value.
 ///
-/// OKX represents *charges* as positive numbers but they reduce the account
-/// balance, hence the value is negated.
+/// OKX reports charges as negative and rebates as positive; Nautilus uses
+/// the opposite commission sign. Fractional currency units are preserved.
 ///
 /// # Errors
 ///
 /// Returns an error if the fee is missing or empty, cannot be parsed into
-/// `Decimal`, or fails internal validation in [`Money::from_decimal`].
+/// `Decimal`, or cannot be represented exactly by native [`Money`].
 pub fn parse_fee(value: Option<&str>, currency: Currency) -> anyhow::Result<Money> {
     // OKX uses opposite sign convention: negative = cost, positive = rebate.
     // Negate to match Nautilus convention: positive = cost, negative = rebate.
     let decimal = required_fee_amount(value)?;
-    Money::from_decimal(-decimal, currency).map_err(Into::into)
+    Money::from_decimal_exact(-decimal, currency).map_err(Into::into)
 }
 
 fn required_fee_amount(value: Option<&str>) -> anyhow::Result<Decimal> {
@@ -452,7 +731,7 @@ fn required_fee_amount(value: Option<&str>) -> anyhow::Result<Decimal> {
         .map(str::trim)
         .filter(|fee| !fee.is_empty())
         .ok_or_else(|| anyhow::anyhow!("missing fee"))?;
-    Decimal::from_str(value).map_err(Into::into)
+    Decimal::from_str_exact(value).map_err(Into::into)
 }
 
 /// Parses OKX fee currency code, handling empty strings.
@@ -800,13 +1079,14 @@ pub fn parse_order_status_report(
             })?
         };
 
-        let filled_qty_dec = parse_quantity(&order.acc_fill_sz, size_precision).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse filled quantity for ord_id={}, acc_fill_sz='{}': {e}",
-                order.ord_id.as_str(),
-                order.acc_fill_sz
-            )
-        })?;
+        let filled_qty_dec = parse_cumulative_fill_quantity(&order.acc_fill_sz, size_precision)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse filled quantity for ord_id={}, acc_fill_sz='{}': {e}",
+                    order.ord_id.as_str(),
+                    order.acc_fill_sz
+                )
+            })?;
 
         (quantity_base, filled_qty_dec)
     } else {
@@ -818,13 +1098,14 @@ pub fn parse_order_status_report(
                 order.sz
             )
         })?;
-        let filled_qty_dec = parse_quantity(&order.acc_fill_sz, size_precision).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse filled quantity for ord_id={}, acc_fill_sz='{}': {e}",
-                order.ord_id.as_str(),
-                order.acc_fill_sz
-            )
-        })?;
+        let filled_qty_dec = parse_cumulative_fill_quantity(&order.acc_fill_sz, size_precision)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse filled quantity for ord_id={}, acc_fill_sz='{}': {e}",
+                    order.ord_id.as_str(),
+                    order.acc_fill_sz
+                )
+            })?;
 
         (quantity_dec, filled_qty_dec)
     };
@@ -1161,6 +1442,16 @@ pub fn parse_fill_report(
     size_precision: u8,
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
+    anyhow::ensure!(
+        !detail.ord_id.as_str().trim().is_empty()
+            && !detail.trade_id.as_str().trim().is_empty()
+            && !detail.fee_ccy.trim().is_empty(),
+        "Fill lacks authoritative order identity, trade identity or fee currency"
+    );
+    let fill_time = detail
+        .fill_time
+        .filter(|time| *time > 0)
+        .ok_or_else(|| anyhow::anyhow!("Fill lacks authoritative execution time"))?;
     let client_order_id = if detail.cl_ord_id.is_empty() {
         None
     } else {
@@ -1171,15 +1462,22 @@ pub fn parse_fill_report(
     let order_side = OrderSide::from(detail.side);
     let last_px = parse_price(&detail.fill_px, price_precision)?;
     let last_qty = parse_quantity(&detail.fill_sz, size_precision)?;
+    anyhow::ensure!(
+        last_qty.is_positive()
+            && last_px.is_positive()
+            && last_qty.as_decimal() == Decimal::from_str_exact(&detail.fill_sz)?
+            && last_px.as_decimal() == Decimal::from_str_exact(&detail.fill_px)?,
+        "Fill quantity or price cannot be represented exactly by the instrument"
+    );
     let fee_dec = required_fee_amount(detail.fee.as_deref()).with_context(|| {
         format!("missing or invalid fee for fill report instrument_id={instrument_id}")
     })?;
     let fee_currency = parse_fee_currency(&detail.fee_ccy, fee_dec, || {
         format!("fill report for instrument_id={instrument_id}")
     });
-    let commission = Money::from_decimal(-fee_dec, fee_currency)?;
+    let commission = Money::from_decimal_exact(-fee_dec, fee_currency)?;
     let liquidity_side: LiquiditySide = detail.exec_type.into();
-    let ts_event = parse_millisecond_timestamp(detail.ts);
+    let ts_event = parse_millisecond_timestamp(fill_time);
 
     Ok(FillReport::new(
         account_id,
@@ -1237,7 +1535,7 @@ pub fn parse_spread_order_status_report(
 ) -> anyhow::Result<OrderStatusReport> {
     let order_type = determine_order_type(order.ord_type, &order.px)?;
     let quantity = parse_quantity(&order.sz, size_precision)?;
-    let filled_qty = parse_quantity(&order.acc_fill_sz, size_precision)?;
+    let filled_qty = parse_cumulative_fill_quantity(&order.acc_fill_sz, size_precision)?;
     let order_side = OrderSide::from(order.side);
     let order_status: OrderStatus = order
         .state
@@ -1330,7 +1628,7 @@ pub fn parse_spread_fill_report(
     let fee_currency = parse_fee_currency(&detail.fee_ccy, fee_dec, || {
         format!("spread fill report for instrument_id={instrument_id}")
     });
-    let commission = Money::from_decimal(-fee_dec, fee_currency)?;
+    let commission = Money::from_decimal_exact(-fee_dec, fee_currency)?;
     let liquidity_side: LiquiditySide = detail.exec_type.into();
     let ts_event = parse_millisecond_timestamp(detail.ts);
 
@@ -2845,6 +3143,133 @@ mod tests {
             },
         },
     };
+
+    #[rstest]
+    #[case(OKXOrderCategory::Normal, false)]
+    #[case(OKXOrderCategory::FullLiquidation, true)]
+    #[case(OKXOrderCategory::PartialLiquidation, true)]
+    #[case(OKXOrderCategory::Adl, true)]
+    fn order_placeholder_preserves_known_execution_and_cumulative_facts(
+        #[case] category: OKXOrderCategory,
+        #[case] documented: bool,
+        #[values(OKXInstrumentType::Spot, OKXInstrumentType::Margin)]
+        instrument_type: OKXInstrumentType,
+        #[values(OKXSide::Buy, OKXSide::Sell)] side: OKXSide,
+    ) {
+        let response: OKXResponse<OKXOrderHistory> =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        let mut order = response.data[0].clone();
+        order.trade_id = Ustr::from("0");
+        order.category = category;
+        order.inst_type = instrument_type;
+        order.side = side;
+        order.acc_fill_sz = "1".into();
+        order.fill_sz = "1".into();
+        order.fill_px = "100".into();
+        order.fee = "-0.01".into();
+        order.fee_ccy = "USDT".into();
+        let account = AccountId::from("OKX-001");
+        let instrument = InstrumentId::from("BTC-USDT.OKX");
+        let incomplete =
+            parse_incomplete_order_fill(&order, account, instrument, UnixNanos::default());
+        assert_eq!(incomplete.trade_id, None);
+        assert_eq!(incomplete.trade_id_placeholder, documented);
+        assert_eq!(incomplete.last_qty, Some(Decimal::ONE));
+        assert_eq!(incomplete.last_px, Some(Decimal::from(100)));
+        let fee = parse_rest_order_fee_evidence(&order, account, instrument, UnixNanos::default())
+            .unwrap();
+        assert_eq!(
+            fee.constraints[0].basis,
+            Some(if side == OKXSide::Sell && !documented {
+                CommissionBasis::UniformLiquidity
+            } else {
+                CommissionBasis::ChargesOnly
+            })
+        );
+        assert_eq!(fee.anchor_trade_id, None);
+        assert_eq!(fee.boundary_quantity, Some(Decimal::ONE));
+        assert_eq!(fee.constraints[0].amount, Some(dec!(0.01)));
+        assert_eq!(fee.constraints[0].currency, Some(Currency::USDT()));
+        assert_eq!(
+            parse_order_trade_id("-90001"),
+            Some(TradeId::from("-90001"))
+        );
+    }
+
+    #[rstest]
+    #[case("", None, false)]
+    #[case("invalid", None, false)]
+    #[case("1.2.3", None, false)]
+    #[case("0.03", Some("0.03"), false)]
+    #[case("-0.03000000000000001", Some("-0.03000000000000001"), false)]
+    #[case("999999999999999999999999999999999999", None, true)]
+    #[case("-99_999_999_999_999_999_999_999_999_999", None, true)]
+    #[case("0.000000000000000000000000000000001", None, true)]
+    #[case("+6E-999999999999999999999999999999", None, true)]
+    #[case("-6.01e+999_999_999_999_999_999_999", None, true)]
+    fn test_parse_incomplete_decimal_preserves_numeric_failure(
+        #[case] value: &str,
+        #[case] expected: Option<&str>,
+        #[case] unrepresentable: bool,
+    ) {
+        let mut held = false;
+        assert_eq!(
+            parse_incomplete_decimal(value, &mut held),
+            expected.map(|value| Decimal::from_str_exact(value).unwrap())
+        );
+        assert_eq!(held, unrepresentable);
+        assert_eq!(parse_incomplete_decimal("1", &mut held), Some(Decimal::ONE));
+        assert_eq!(held, unrepresentable);
+        assert_eq!(parse_incomplete_decimal("invalid", &mut held), None);
+        assert_eq!(held, unrepresentable);
+    }
+
+    #[rstest]
+    #[case::empty("", "", "", 0, false, false)]
+    #[case::placeholders("", "0", "0.0", 0, false, false)]
+    #[case::trade_only("T1", "0", "0", 0, true, false)]
+    #[case::quantity_only("", "0.01", "", 0, true, false)]
+    #[case::negative_quantity("", "-0.01", "", 0, true, false)]
+    #[case::price_only("", "", "10", 0, true, false)]
+    #[case::time_only("", "", "", 1, true, false)]
+    #[case::malformed_quantity("", "invalid", "", 0, true, true)]
+    #[case::malformed_price("T1", "0.01", "invalid", 1, true, true)]
+    #[case::unrepresentable("", "1e-99999999999999999999", "", 0, true, true)]
+    fn test_successful_order_query_retains_last_execution(
+        #[case] trade: &str,
+        #[case] qty: &str,
+        #[case] px: &str,
+        #[case] time: u64,
+        #[case] present: bool,
+        #[case] fresh: bool,
+    ) {
+        let mut response: OKXResponse<OKXOrderHistory> =
+            serde_json::from_str(&load_test_json("http_get_orders_history.json")).unwrap();
+        let order = &mut response.data[0];
+        order.trade_id = trade.into();
+        order.fill_sz = qty.into();
+        order.fill_px = px.into();
+        order.fill_time = time;
+        let snapshot = parse_order_status_report(
+            order,
+            AccountId::from("OKX-001"),
+            InstrumentId::from("BTC-USDT-SWAP.OKX"),
+            1,
+            2,
+            UnixNanos::from(10),
+        )
+        .unwrap();
+        let observed = parse_order_fill_observation(order, &snapshot);
+        assert_eq!(observed.is_some(), present);
+        if let Some(observed) = observed {
+            assert_eq!(observed.requires_fresh_query, fresh);
+            assert_eq!(observed.ts_init, UnixNanos::from(10));
+            assert!(observed.last_qty.is_none_or(|qty| !qty.is_zero()));
+            assert!(observed.last_px.is_none_or(|px| !px.is_zero()));
+            assert_eq!(observed.commission_amount, None);
+            assert_eq!(observed.commission_currency, None);
+        }
+    }
 
     #[rstest]
     fn test_parse_fee_currency_with_zero_fee_empty_string() {
@@ -4632,6 +5057,7 @@ mod tests {
     #[case(Some(OKXPositionSide::Short), Some("BTC-USDT-SWAP.OKX-SHORT"))]
     fn test_fill_report_parsing(
         #[case] pos_side: Option<OKXPositionSide>,
+        #[values(Some(1_625_097_599_000))] fill_time: Option<u64>,
         #[case] expected: Option<&str>,
     ) {
         // Create a mock transaction detail for testing
@@ -4650,6 +5076,7 @@ mod tests {
             fee_ccy: "USDT".to_string(),
             fee: Some("0.042".to_string()),
             ts: 1_625_097_600_000,
+            fill_time,
         };
 
         let account_id = AccountId::new("OKX-001");
@@ -4667,6 +5094,10 @@ mod tests {
         assert_eq!(
             fill_report.venue_position_id,
             expected.map(PositionId::from)
+        );
+        assert_eq!(
+            fill_report.ts_event,
+            parse_millisecond_timestamp(fill_time.unwrap_or(transaction_detail.ts))
         );
         assert_eq!(fill_report.account_id, account_id);
         assert_eq!(fill_report.instrument_id, instrument_id);
@@ -4694,6 +5125,35 @@ mod tests {
 
         let blank = parse_fee(Some("   "), currency).unwrap_err();
         assert!(blank.to_string().contains("missing fee"));
+    }
+
+    #[rstest]
+    #[case("tradeId", serde_json::json!(""))]
+    #[case("ordId", serde_json::json!(""))]
+    #[case("feeCcy", serde_json::json!(""))]
+    #[case("fillTime", serde_json::json!(null))]
+    #[case("fillTime", serde_json::json!("0"))]
+    #[case("fillSz", serde_json::json!("0.00100000001"))]
+    #[case("fillPx", serde_json::json!("42000.501"))]
+    fn test_fill_report_rejects_ambiguous_or_rounded_values(
+        #[case] field: &str,
+        #[case] value: serde_json::Value,
+    ) {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(&load_test_json("http_transaction_detail.json")).unwrap();
+        payload[field] = value;
+        let detail: OKXTransactionDetail = serde_json::from_value(payload).unwrap();
+        assert!(
+            parse_fill_report(
+                &detail,
+                AccountId::from("OKX-001"),
+                InstrumentId::from("BTC-USDT.OKX"),
+                2,
+                8,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
     }
 
     #[rstest]

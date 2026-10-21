@@ -20,10 +20,21 @@
 
 use std::time::Duration;
 
+use nautilus_common::messages::execution::IncompleteFillReport;
 use nautilus_network::http::{HttpClientError, StatusCode};
 use thiserror::Error;
 
 use crate::common::consts::should_retry_error_code;
+
+/// Contradictory or invalid economic evidence in a successful venue response.
+#[derive(Debug, Error)]
+#[error("Conflicting authoritative fill evidence: {0}")]
+pub(crate) struct ConflictingFillEvidence(pub(crate) &'static str);
+
+/// Parsed identity and independent facts from an unusable cumulative order status.
+#[derive(Debug, Error)]
+#[error("Incomplete order fill evidence")]
+pub(crate) struct IncompleteOrderFill(pub(crate) IncompleteFillReport);
 
 /// Represents a build error for query parameter validation.
 #[derive(Debug, Error)]

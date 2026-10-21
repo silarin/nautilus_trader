@@ -48,7 +48,7 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelOrder, ExecutionReport as CommonExecutionReport, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+            OrderFeeOrigin, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
             report::{GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports},
         },
     },
@@ -327,9 +327,24 @@ async fn recv_query_order_report(
                     panic!("event stream closed before query order report");
                 };
 
-                if let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = event {
-                    assert_eq!(report.client_order_id, expected_client_order_id);
-                    return *report;
+                match event {
+                    ExecutionEvent::Report(CommonExecutionReport::Order(report)) => {
+                        assert_eq!(report.client_order_id, expected_client_order_id);
+                        assert!(report.filled_qty.is_zero());
+                        return *report;
+                    }
+                    ExecutionEvent::Report(CommonExecutionReport::OrderQueryWithFills(report, fills)) => {
+                        assert_eq!(report.client_order_id, expected_client_order_id);
+
+                        if fills.is_empty() {
+                            continue;
+                        }
+                        assert_eq!(fills.len(), 1);
+                        assert_eq!(fills[0].venue_order_id, report.venue_order_id);
+                        assert_eq!(fills[0].last_qty, report.filled_qty);
+                        return *report;
+                    }
+                    _ => {}
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -1511,6 +1526,8 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         live.trade_id.clear();
         live.fee = None;
         live.fill_fee = None;
+        live.fill_time = 0;
+        live.rebate = Some("0".to_string());
 
         dispatch_ws_message(
             OKXWsMessage::Orders(vec![live]),
@@ -1543,11 +1560,30 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         get_atomic_clock_realtime(),
     );
 
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), if send_live { 1 } else { 2 });
-    let filled_index = usize::from(!send_live);
+    let mut events = drain_events(&mut rx);
+    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
+    else {
+        panic!("Expected cumulative fee facts before execution delivery");
+    };
+    assert!(!fee.constraints.is_empty());
+    assert!(
+        fee.boundary_quantity
+            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
+    );
+
+    assert!(matches!(events.last().unwrap(),
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
+            && fills[0].last_qty == report.filled_qty));
+    assert_eq!(events.len(), if send_live { 3 } else { 4 });
+    assert!(matches!(&events[0],
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+            if report.client_order_id == Some(client_order_id) && report.venue_order_id == venue_order_id
+                && report.filled_qty == Quantity::from("0.003") && fills.len() == 1));
+    let filled_index = 1 + usize::from(!send_live);
+
     if !send_live {
-        assert_venue_order_id_update(&events[0]);
+        assert_venue_order_id_update(&events[1]);
     }
 
     match &events[filled_index] {
@@ -1588,7 +1624,17 @@ fn test_dispatch_tracked_algo_child_fill_with_empty_client_order_id(#[case] send
         get_atomic_clock_realtime(),
     );
 
-    assert!(drain_events(&mut rx).is_empty());
+    let mut duplicates = drain_events(&mut rx);
+    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(repeated_fee)) =
+        duplicates.remove(0)
+    else {
+        panic!("Expected retained duplicate cumulative facts");
+    };
+    assert!(fee.same_observation(&repeated_fee));
+    assert_eq!(duplicates.len(), 1);
+    assert!(
+        matches!(&duplicates[0], ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(_, fills)) if fills.len() == 1)
+    );
 }
 
 #[rstest]
@@ -1624,9 +1670,26 @@ fn test_dispatch_untracked_algo_child_fill_with_empty_client_order_id_as_report(
         get_atomic_clock_realtime(),
     );
 
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 1);
-    match &events[0] {
+    let mut events = drain_events(&mut rx);
+    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
+    else {
+        panic!("Expected cumulative fee facts before execution delivery");
+    };
+    assert!(!fee.constraints.is_empty());
+    assert!(
+        fee.boundary_quantity
+            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
+    );
+
+    assert!(matches!(events.last().unwrap(),
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
+            && fills[0].last_qty == report.filled_qty));
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[0],
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+            if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
+    match &events[1] {
         ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
             assert_eq!(report.account_id, AccountId::from("OKX-001"));
             assert_eq!(report.instrument_id, instrument_id);
@@ -1732,9 +1795,26 @@ fn test_dispatch_venue_initiated_order_fill_as_report(#[case] case: VenueFillCas
         get_atomic_clock_realtime(),
     );
 
-    let events = drain_events(&mut rx);
-    assert_eq!(events.len(), 1);
-    match &events[0] {
+    let mut events = drain_events(&mut rx);
+    let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) = events.remove(0)
+    else {
+        panic!("Expected cumulative fee facts before execution delivery");
+    };
+    assert!(!fee.constraints.is_empty());
+    assert!(
+        fee.boundary_quantity
+            .is_some_and(|quantity| quantity.is_sign_positive() && !quantity.is_zero())
+    );
+
+    assert!(matches!(events.last().unwrap(),
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+        if fills.len() == 1 && fills[0].venue_order_id == report.venue_order_id
+            && fills[0].last_qty == report.filled_qty));
+    assert_eq!(events.len(), 3);
+    assert!(matches!(&events[0],
+        ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+            if report.client_order_id.is_none() && report.filled_qty.is_positive() && fills.len() == 1));
+    match &events[1] {
         ExecutionEvent::Report(CommonExecutionReport::Fill(report)) => {
             // Venue-initiated flow (liquidation or ADL): no client order ID,
             // surfaced as a fill report
@@ -2841,12 +2921,22 @@ fn regular_order_detail_response(params: &HashMap<String, String>) -> serde_json
     order["clOrdId"] = json!(client_order_id);
     order["fillPx"] = json!(if is_filled { price } else { "" });
     order["fillSz"] = json!(if is_filled { "1" } else { "" });
+    if !is_filled {
+        order["fee"] = json!("0");
+        order["rebate"] = json!("0");
+        order["fillTime"] = json!("0");
+        order["tradeId"] = json!("");
+    }
     order["instId"] = json!("ETH-USDT-SWAP");
     order["ordId"] = json!(venue_order_id);
     order["ordType"] = json!(order_type);
     order["posSide"] = json!("net");
     order["px"] = json!(if order_type == "market" { "" } else { price });
     order["state"] = json!(state);
+    // Conditional child fixtures must retain their cached parent's sell side
+    if !algo_client_order_id.is_empty() {
+        order["side"] = json!("sell");
+    }
     order["sz"] = json!("1");
     order["tdMode"] = json!("cross");
     response
@@ -2966,6 +3056,22 @@ async fn start_exec_query_order_test_server(state: Arc<QueryOrderRouteState>) ->
                     state.regular_queries.lock().await.push(params);
                     Json(response).into_response()
                 }
+            }),
+        )
+        .route(
+            "/api/v5/trade/fills",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                assert_eq!(params.get("instType").unwrap(), "SWAP");
+                assert_eq!(params.get("instId").unwrap(), "ETH-USDT-SWAP");
+                let response = regular_order_detail_response(&params);
+                let order = &response["data"][0];
+                Json(json!({"code":"0", "msg":"", "data":[{
+                    "instType":"SWAP", "instId":"ETH-USDT-SWAP",
+                    "ordId":order["ordId"], "clOrdId":"", "tradeId":"query-fill-1",
+                    "billId":"query-bill-1", "fillSz":order["accFillSz"], "fillPx":order["avgPx"],
+                    "side":order["side"], "posSide":"net", "execType":"T",
+                    "fee":"-0.1", "feeCcy":"USDT", "ts":order["uTime"], "fillTime":order["uTime"]
+                }]}))
             }),
         )
         .route(
@@ -6643,6 +6749,19 @@ async fn start_mass_status_triggered_child_server(
         order["uTime"] = json!(now_ms);
         Json(response).into_response()
     });
+    let fills = get(
+        move |Query(params): Query<HashMap<String, String>>| async move {
+            if filled_qty == "0" || !params.contains_key("ordId") {
+                return Json(json!({"code":"0", "msg":"", "data":[]}));
+            }
+            Json(json!({"code":"0", "msg":"", "data":[{
+                "instType":"SWAP", "instId":response_instrument_id,
+                "ordId":params["ordId"], "clOrdId":"", "tradeId":"90001", "billId":"80001",
+                "fillSz":filled_qty, "fillPx":"850.00", "side":"buy", "posSide":"net", "execType":"T",
+                "fee":"-0.01", "feeCcy":"USDT", "ts":"1000", "fillTime":"1000"
+            }]}))
+        },
+    );
     let empty = get(|| async { Json(json!({"code": "0", "msg": "", "data": []})).into_response() });
     let router = Router::new()
         .route("/api/v5/trade/order", order_detail)
@@ -6650,7 +6769,7 @@ async fn start_mass_status_triggered_child_server(
         .route("/api/v5/trade/orders-history", regular_history)
         .route("/api/v5/trade/orders-algo-pending", empty.clone())
         .route("/api/v5/trade/orders-algo-history", algo_history)
-        .route("/api/v5/trade/fills", empty.clone())
+        .route("/api/v5/trade/fills", fills)
         .route("/api/v5/trade/fills-history", empty.clone())
         .route("/api/v5/account/positions", empty)
         .route(
@@ -7222,6 +7341,9 @@ impl BootstrapServer {
             order["state"] = json!("live");
             order["accFillSz"] = json!("0");
             order["fillSz"] = json!("0");
+            order["fillTime"] = json!("0");
+            order["fee"] = json!("0");
+            order["rebate"] = json!("0");
             order["tradeId"] = json!("");
             self.ws.messages.as_ref().unwrap().send(message).unwrap();
 
@@ -7801,50 +7923,118 @@ async fn test_imported_order_first_amend_confirmation(
     msg["tradeId"] = json!(if with_fill { "1518905529" } else { "" });
     msg["fee"] = json!("0");
     server.ws.messages.as_ref().unwrap().send(message).unwrap();
-    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-
-    let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = first else {
-        panic!("expected imported amendment first, was {first:?}");
-    };
-
-    let expected = OrderUpdated::new(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        cid,
-        Quantity::from("3"),
-        updated.event_id,
-        UnixNanos::from(1_746_947_317_402_000_000),
-        updated.ts_init,
-        false,
-        Some(vid),
-        Some(client.account_id()),
-        Some(Price::from("50100.0")),
-        None,
-        None,
-        false,
-    );
-    assert_eq!(updated, expected);
-    order.apply(OrderEventAny::Updated(updated)).unwrap();
-
-    if with_fill {
+    // Both authenticated sockets receive the fixture. Economic events are deduplicated,
+    // while each received fee and execution observation remains visible.
+    let mut received = Vec::new();
+    let mut fees = 0;
+    let mut updates = 0;
+    let mut fills = 0;
+    while fees < 2 || updates < 1 || fills < usize::from(with_fill) {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
             .unwrap();
 
-        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
-            panic!("expected fill after amendment, was {event:?}");
-        };
-
-        assert_eq!(fill.last_qty, Quantity::from("2"));
-        order.apply(OrderEventAny::Filled(fill)).unwrap();
+        match &event {
+            ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(_)) => fees += 1,
+            ExecutionEvent::Order(OrderEventAny::Updated(_)) => updates += 1,
+            ExecutionEvent::Order(OrderEventAny::Filled(_)) => fills += 1,
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(_, _)) => {}
+            _ => panic!("unexpected imported amendment event: {event:?}"),
+        }
+        received.push(event);
     }
-
     client.disconnect().await.unwrap();
+    received.extend(drain_events(&mut rx));
+    let mut fee_count = 0;
+    let mut evidence_count = 0;
+    let mut update_count = 0;
+    let mut fill_count = 0;
+
+    for event in received {
+        match event {
+            ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) => {
+                fee_count += 1;
+                assert_eq!(fee.account_id, client.account_id());
+                assert_eq!(fee.instrument_id, order.instrument_id());
+                assert_eq!(fee.client_order_id, Some(cid));
+                assert_eq!(fee.venue_order_id, vid);
+                assert_eq!(
+                    fee.boundary_quantity,
+                    Some(if with_fill { dec!(2) } else { dec!(0) })
+                );
+                assert_eq!(fee.origin, OrderFeeOrigin::Stream);
+            }
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(status, reports)) => {
+                evidence_count += 1;
+                assert!(with_fill);
+                assert_eq!(status.account_id, client.account_id());
+                assert_eq!(status.instrument_id, order.instrument_id());
+                assert_eq!(status.client_order_id, Some(cid));
+                assert_eq!(status.venue_order_id, vid);
+                assert_eq!(status.order_status, OrderStatus::PartiallyFilled);
+                assert_eq!(status.quantity, Quantity::from("3"));
+                assert_eq!(status.filled_qty, Quantity::from("2"));
+                assert_eq!(reports.len(), 1);
+                let fill = &reports[0];
+                assert_eq!(fill.account_id, client.account_id());
+                assert_eq!(fill.instrument_id, order.instrument_id());
+                assert_eq!(fill.client_order_id, Some(cid));
+                assert_eq!(fill.venue_order_id, vid);
+                assert_eq!(fill.trade_id, TradeId::from("1518905529"));
+                assert_eq!(fill.last_qty, Quantity::from("2"));
+                assert_eq!(fill.last_px, Price::from("50100.0"));
+                assert_eq!(fill.commission, Money::from("0 USDT"));
+            }
+            ExecutionEvent::Order(OrderEventAny::Updated(updated)) => {
+                update_count += 1;
+                let expected = OrderUpdated::new(
+                    order.trader_id(),
+                    order.strategy_id(),
+                    order.instrument_id(),
+                    cid,
+                    Quantity::from("3"),
+                    updated.event_id,
+                    UnixNanos::from(1_746_947_317_402_000_000),
+                    updated.ts_init,
+                    false,
+                    Some(vid),
+                    Some(client.account_id()),
+                    Some(Price::from("50100.0")),
+                    None,
+                    None,
+                    false,
+                );
+                assert_eq!(updated, expected);
+                order.apply(OrderEventAny::Updated(updated)).unwrap();
+            }
+            ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+                fill_count += 1;
+                assert!(with_fill);
+                assert_eq!(update_count, 1);
+                assert!(
+                    evidence_count > 0,
+                    "economic fill must follow its admission evidence"
+                );
+                assert_eq!(fill.trade_id, TradeId::from("1518905529"));
+                assert_eq!(fill.last_qty, Quantity::from("2"));
+                assert_eq!(fill.last_px, Price::from("50100.0"));
+                assert_eq!(fill.commission, Some(Money::from("0 USDT")));
+                order.apply(OrderEventAny::Filled(fill)).unwrap();
+            }
+            event => panic!("unexpected imported amendment event: {event:?}"),
+        }
+    }
+    assert_eq!(fee_count, 2);
+    assert_eq!(update_count, 1);
+    assert_eq!(fill_count, usize::from(with_fill));
+    if with_fill {
+        // A duplicate stream may retain only its companion, or both admission and
+        // companion evidence, depending on when the shared trade cache is updated.
+        assert!((2..=4).contains(&evidence_count));
+    } else {
+        assert_eq!(evidence_count, 0);
+    }
     assert!(rx.try_recv().is_err());
     assert_eq!(
         order.status(),

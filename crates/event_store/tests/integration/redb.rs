@@ -60,7 +60,7 @@ fn manifest(run_id: &str) -> RunManifest {
         binary_hash: "deadbeef".to_string(),
         schema_version: 1,
         crate_versions: "feedface".to_string(),
-        feature_flags: Vec::new(),
+        feature_flags: vec!["order-capture=committed-routes-cumulative-fees-v2".to_string()],
         adapter_versions: IndexMap::new(),
         config_hash: "cafebabe".to_string(),
         registered_components: RegisteredComponents::default(),
@@ -1374,8 +1374,12 @@ fn generated_replay_actions() -> impl Strategy<Value = Vec<GeneratedReplayAction
         })
 }
 
-fn append_replay_payload(seq: u64, payload_type: &str, payload: Bytes) -> AppendEntry {
-    let topic: Topic = "replay.fidelity".into();
+fn append_replay_payload(
+    seq: u64,
+    payload_type: &str,
+    payload: Bytes,
+    topic: Topic,
+) -> AppendEntry {
     let ts = UnixNanos::from(seq);
     let headers = Headers::empty();
     let hash = compute_entry_hash(
@@ -1402,13 +1406,25 @@ fn append_replay_payload(seq: u64, payload_type: &str, payload: Bytes) -> Append
 
 fn append_replay_account_state(seq: u64, state: &AccountState) -> AppendEntry {
     let encoded = encode_account_state(state).expect("encode account state");
-    append_replay_payload(seq, PAYLOAD_TYPE_ACCOUNT_STATE, encoded.payload)
+    append_replay_payload(
+        seq,
+        PAYLOAD_TYPE_ACCOUNT_STATE,
+        encoded.payload,
+        "events.account.SIM".into(),
+    )
 }
 
 fn append_replay_order_event(seq: u64, event: &OrderEventAny) -> AppendEntry {
     let encoded = encode_order_event_any(event).expect("encode order event");
     let payload_type = encoded.payload_type.expect("order event payload type");
-    append_replay_payload(seq, payload_type.as_str(), encoded.payload)
+    append_replay_payload(
+        seq,
+        payload_type.as_str(),
+        encoded.payload,
+        nautilus_common::msgbus::switchboard::get_event_order_topic(event.strategy_id())
+            .as_str()
+            .into(),
+    )
 }
 
 fn generated_account_state(balance: u32) -> AccountState {

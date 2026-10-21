@@ -998,6 +998,84 @@ mod tests {
     use crate::enums::CurrencyType;
 
     #[rstest]
+    #[case("0.011995693", "USD")]
+    #[case("-0.011995693", "USD")]
+    #[case("0.000000001", "USDT")]
+    #[case("1234.000000001", "USDT")]
+    fn test_exact_money_preserves_fractional_currency_units(
+        #[case] amount: &str,
+        #[case] code: &str,
+    ) {
+        let currency = Currency::from(code);
+        let decimal = Decimal::from_str_exact(amount).unwrap();
+        let money = Money::from_decimal_exact(decimal, currency).unwrap();
+        assert_eq!(money.currency.precision, currency.precision);
+        assert_eq!(money.as_decimal(), decimal);
+        assert_eq!(money.to_string(), format!("{amount} {code}"));
+        assert_eq!(
+            money.to_formatted_string().replace('_', ""),
+            format!("{amount} {code}")
+        );
+        assert_eq!(Money::from_str_exact(&money.to_string()).unwrap(), money);
+        let encoded = serde_json::to_vec(&money).unwrap();
+        assert_eq!(serde_json::from_slice::<Money>(&encoded).unwrap(), money);
+        assert_eq!((Money::zero(currency) + money).as_decimal(), decimal);
+        assert_eq!((-money).as_decimal(), -decimal);
+        assert_eq!(
+            money.checked_add(money).unwrap().as_decimal(),
+            decimal + decimal
+        );
+        assert_eq!(money.checked_sub(money).unwrap(), Money::zero(currency));
+        // Existing rounded constructors remain explicit, compatible choices.
+        assert_eq!(
+            money.normalized(),
+            Money::from_decimal(decimal, currency).unwrap()
+        );
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_exact_money_preserves_okx_eleven_decimal_fee() {
+        let amount = dec!(0.01199569384);
+        let fee = Money::from_decimal_exact(amount, Currency::USDT()).unwrap();
+        assert_eq!(fee.as_decimal(), amount);
+        assert_eq!(fee.to_string(), "0.01199569384 USDT");
+        assert_eq!(
+            serde_json::from_str::<Money>(&serde_json::to_string(&fee).unwrap()).unwrap(),
+            fee
+        );
+    }
+
+    #[rstest]
+    #[case(MONEY_RAW_MAX - 1)]
+    #[case(MONEY_RAW_MIN + 1)]
+    fn test_exact_money_serde_preserves_native_raw_range(#[case] raw: MoneyRaw) {
+        let money = Money::from_raw(raw, Currency::USDT());
+        let encoded = serde_json::to_string(&money).unwrap();
+        assert_eq!(serde_json::from_str::<Money>(&encoded).unwrap().raw, raw);
+    }
+
+    #[rstest]
+    #[case("1e3 USD", "1000.00 USD")]
+    #[case("1.1995693E-2 USD", "0.011995693 USD")]
+    #[case("-1e-9 USDT", "-0.000000001 USDT")]
+    fn test_exact_money_scientific_serde(#[case] input: &str, #[case] expected: &str) {
+        let encoded = serde_json::to_string(input).unwrap();
+        let money: Money = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(money.to_string(), expected);
+    }
+
+    #[rstest]
+    fn test_exact_money_rejects_unrepresentable_amounts() {
+        let too_precise = Decimal::new(1, u32::from(FIXED_PRECISION) + 1);
+        assert!(Money::from_decimal_exact(too_precise, Currency::USD()).is_err());
+        assert!(Money::from_decimal_exact(Decimal::MAX, Currency::USD()).is_err());
+        let mut invalid = Currency::USD();
+        invalid.precision = 255;
+        assert!(Money::from_decimal_exact(Decimal::ONE, invalid).is_err());
+    }
+
+    #[rstest]
     #[case(dec!(1.0001), "1.0001 USD")]
     #[case(dec!(0.000001), "0.000001 USD")]
     #[case(dec!(-0.000001), "-0.000001 USD")]

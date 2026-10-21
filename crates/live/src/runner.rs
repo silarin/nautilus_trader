@@ -632,6 +632,13 @@ impl AsyncRunner {
 
 #[cfg(feature = "node")]
 impl AsyncRunner {
+    pub(crate) fn drain_pending_exec_events(&mut self) -> Vec<DispatchMessage<ExecutionEvent>> {
+        let count = self.channels.exec_evt_rx.len();
+        (0..count)
+            .filter_map(|_| self.channels.exec_evt_rx.try_recv().ok())
+            .collect()
+    }
+
     pub(crate) fn poll_pending(&mut self, mut process: impl FnMut(PendingRunnerEvent)) -> usize {
         self.bind_senders();
 

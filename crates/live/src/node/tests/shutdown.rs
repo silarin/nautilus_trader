@@ -115,7 +115,7 @@ async fn test_report_shutdown_timeout_preserves_disconnect_budget() {
     }
     drop(collection);
     node.exec_clients = vec![client.clone()];
-    let failure = node.finalize_stop().await.unwrap_err();
+    let failure = node.finalize_stop(None).await.unwrap_err();
     let disconnected = node.kernel.check_engines_disconnected();
 
     // The report worker runs on a separate runtime, so bound its cleanup in real time
