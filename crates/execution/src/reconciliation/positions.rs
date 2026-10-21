@@ -28,9 +28,11 @@ use nautilus_model::{
         AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
         TimeInForce,
     },
-    identifiers::{AccountId, InstrumentId, VenueOrderId},
+    events::OrderEventAny,
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
+    position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
 };
@@ -42,6 +44,142 @@ use super::{
     reconciliation_price,
     types::{FillAdjustmentResult, FillSnapshot, ReconciliationResult, VenuePositionSnapshot},
 };
+
+/// Returns whether a new execution would be inserted before retained native activity.
+///
+/// Historical duplicates remain idempotent. A new earlier execution or an execution tied
+/// with another order has no proven accounting order, so callers must retain recovery.
+/// Ordered native stream events can share timestamps; recovery reports cannot prove that order.
+#[must_use]
+pub fn fill_precedes_committed_activity(
+    cache: &Cache,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    venue_order_id: VenueOrderId,
+    trade_id: TradeId,
+    ts_event: UnixNanos,
+    ordered_stream: bool,
+) -> bool {
+    let orders = cache.orders_refs(None, Some(&instrument_id), None, Some(&account_id), None);
+    if orders.iter().any(|order| {
+        order.venue_order_id() == Some(venue_order_id) && order.trade_ids().contains(&&trade_id)
+    }) {
+        return false;
+    }
+    cache
+        .positions_refs(None, Some(&instrument_id), None, Some(&account_id), None)
+        .iter()
+        .any(|position| position.ts_last > ts_event)
+        || orders.iter().any(|order| {
+            let ids = order.trade_ids();
+            order.events().iter().any(|event| {
+                matches!(event,
+                OrderEventAny::Filled(fill)
+                    if ids.contains(&&fill.trade_id)
+                        && (fill.ts_event > ts_event
+                            || ((!ordered_stream || fill.reconciliation) && fill.ts_event == ts_event
+                                && fill.venue_order_id != venue_order_id)))
+            })
+        })
+}
+
+/// Whether unordered recovery reports could allocate tied executions to different position episodes.
+///
+/// Complete histories can extend exposure with tied fills, but cannot establish the order of
+/// executions that reduce or reverse it. Standalone fragments additionally need a complete query
+/// before reducing exposure or extending a tied execution sequence. Exact duplicates and native
+/// snapshot-covered order-only history do not change position accounting.
+#[must_use]
+pub fn fills_have_ambiguous_position_order(
+    cache: &Cache,
+    fills: &[FillReport],
+    complete_history: bool,
+) -> bool {
+    let pending: Vec<_> = fills
+        .iter()
+        .filter(|fill| {
+            !fill_precedes_snapshot_reconciled_position(cache, fill)
+                && !cache
+                    .orders_refs(
+                        None,
+                        Some(&fill.instrument_id),
+                        None,
+                        Some(&fill.account_id),
+                        None,
+                    )
+                    .iter()
+                    .any(|order| {
+                        order.venue_order_id() == Some(fill.venue_order_id)
+                            && order.trade_ids().contains(&&fill.trade_id)
+                    })
+        })
+        .collect();
+
+    pending.iter().any(|fill| {
+        let positions = cache.positions_refs(
+            None,
+            Some(&fill.instrument_id),
+            None,
+            Some(&fill.account_id),
+            None,
+        );
+        let opposes_at_timestamp = |position: &Position| {
+            position.instrument_id == fill.instrument_id
+                && position.entry != fill.order_side
+                && position.ts_opened <= fill.ts_event
+                && position
+                    .ts_closed
+                    .is_none_or(|closed| closed >= fill.ts_event)
+        };
+        let opposing = positions.iter().any(|position| {
+            position.is_opposite_side(fill.order_side) || opposes_at_timestamp(position)
+        }) || cache
+            .position_snapshots(None, Some(&fill.account_id))
+            .iter()
+            .any(opposes_at_timestamp)
+            || pending.iter().any(|earlier| {
+                earlier.account_id == fill.account_id
+                    && earlier.instrument_id == fill.instrument_id
+                    && earlier.ts_event <= fill.ts_event
+                    && earlier.order_side != fill.order_side
+            });
+        let tied = pending.iter().any(|other| {
+            other.account_id == fill.account_id
+                && other.instrument_id == fill.instrument_id
+                && other.ts_event == fill.ts_event
+                && other.trade_id != fill.trade_id
+        });
+        let cross_order = pending.iter().any(|other| {
+            other.account_id == fill.account_id
+                && other.instrument_id == fill.instrument_id
+                && other.ts_event == fill.ts_event
+                && other.venue_order_id != fill.venue_order_id
+        });
+        let cached_tie = cache
+            .orders_refs(
+                None,
+                Some(&fill.instrument_id),
+                None,
+                Some(&fill.account_id),
+                None,
+            )
+            .iter()
+            .any(|order| {
+                let ids = order.trade_ids();
+                order.events().iter().any(|event| {
+                    matches!(event, OrderEventAny::Filled(previous)
+                    if ids.contains(&&previous.trade_id) && previous.ts_event == fill.ts_event
+                        && previous.trade_id != fill.trade_id)
+                })
+            });
+        cross_order
+            || if complete_history {
+                opposing && (tied || cached_tie)
+            } else {
+                opposing || cached_tie
+            }
+    })
+}
 
 const DEFAULT_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 4); // 0.0001
 

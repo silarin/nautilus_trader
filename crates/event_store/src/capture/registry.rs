@@ -29,7 +29,8 @@
 //! A registration may additionally carry an identity extractor: production dispatch pushes
 //! the same typed message through multiple tap-visible boundaries (an order event is sent
 //! to the portfolio endpoint and published on its strategy topic), and the adapter uses the
-//! extracted identity to capture each logical message exactly once.
+//! extracted identity to deduplicate messages. Order events are deduplicated per route
+//! so their committed publication survives an earlier ingress observation.
 
 use std::{
     any::{Any, TypeId},

@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 
-use nautilus_common::enums::LogColor;
+use nautilus_common::{enums::LogColor, messages::execution::IncompleteFillReport};
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{LiquiditySide, OrderStatus, OrderType},
@@ -42,6 +42,409 @@ use super::{
     positions::{cap_price_at_instrument_max, is_within_single_unit_tolerance},
     reconciliation_price,
 };
+
+/// Compares venue fill evidence without transient report IDs or receipt timestamps.
+#[must_use]
+pub fn fill_evidence_matches(left: &FillReport, right: &FillReport) -> bool {
+    left.client_order_id == right.client_order_id && fill_execution_matches(left, right)
+}
+
+/// Compares fill evidence after resolving omitted client IDs through a native order.
+///
+/// Every supplied identity must match the order; missing IDs cannot erase conflicting
+/// known IDs. This is compatibility proof, not equivalence for evidence deduplication.
+#[must_use]
+pub fn fill_evidence_matches_with_order(
+    order: &OrderAny,
+    left: &FillReport,
+    right: &FillReport,
+) -> bool {
+    order.account_id() == Some(left.account_id)
+        && order.instrument_id() == left.instrument_id
+        && order.venue_order_id() == Some(left.venue_order_id)
+        && order.order_side() == left.order_side
+        && left
+            .client_order_id
+            .is_none_or(|id| id == order.client_order_id())
+        && right
+            .client_order_id
+            .is_none_or(|id| id == order.client_order_id())
+        && fill_execution_matches(left, right)
+}
+
+fn fill_execution_matches(left: &FillReport, right: &FillReport) -> bool {
+    left.account_id == right.account_id
+        && left.instrument_id == right.instrument_id
+        && left.venue_order_id == right.venue_order_id
+        && left.venue_position_id == right.venue_position_id
+        && left.trade_id == right.trade_id
+        && left.order_side == right.order_side
+        && left.last_qty == right.last_qty
+        && left.last_px == right.last_px
+        && left.commission == right.commission
+        && left.liquidity_side == right.liquidity_side
+        && left.ts_event == right.ts_event
+}
+
+/// Checks standalone venue evidence against an active, exact native order execution.
+#[must_use]
+pub fn fill_evidence_is_committed(order: &OrderAny, expected: &FillReport) -> bool {
+    if expected.last_qty.is_zero()
+        || expected
+            .client_order_id
+            .is_some_and(|id| id != order.client_order_id())
+        || super::inferred_reconciliation_trade_ids(order).map_or(true, |ids| !ids.is_empty())
+    {
+        return false;
+    }
+    let active_ids = order.trade_ids();
+    order.events().iter().any(|event| matches!(event, OrderEventAny::Filled(fill)
+        if active_ids.contains(&&fill.trade_id) && fill.trade_id == expected.trade_id
+            && !fill.trade_id.as_str().starts_with("synth-")
+            && fill.account_id == expected.account_id && fill.instrument_id == expected.instrument_id
+            && fill.venue_order_id == expected.venue_order_id && fill.order_side == expected.order_side
+            && expected.venue_position_id.is_none_or(|id| fill.position_id == Some(id))
+            && fill.last_qty == expected.last_qty && fill.last_px == expected.last_px
+            && fill.liquidity_side == expected.liquidity_side
+            && fill.ts_event == expected.ts_event && fill.commission == Some(expected.commission)))
+}
+
+/// Compares query obligations without transient report identifiers or receipt timestamps.
+#[must_use]
+pub fn query_fill_evidence_matches(
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+    other: &OrderStatusReport,
+    other_fills: &[FillReport],
+) -> bool {
+    report.account_id == other.account_id
+        && report.instrument_id == other.instrument_id
+        && report.client_order_id == other.client_order_id
+        && report.venue_order_id == other.venue_order_id
+        && report.venue_position_id == other.venue_position_id
+        && report.order_side == other.order_side
+        && report.filled_qty == other.filled_qty
+        && report.ts_last == other.ts_last
+        && fills.len() == other_fills.len()
+        && fills
+            .iter()
+            .map(|fill| fill.trade_id)
+            .collect::<HashSet<_>>()
+            .len()
+            == fills.len()
+        && fills.iter().all(|fill| {
+            other_fills
+                .iter()
+                .any(|other| fill_evidence_matches(fill, other))
+        })
+}
+
+/// Checks that companion trades exactly cover a queried venue order snapshot.
+#[must_use]
+pub fn query_fill_history_complete(report: &OrderStatusReport, fills: &[FillReport]) -> bool {
+    let mut ids = HashSet::new();
+    let mut quantity = Decimal::ZERO;
+
+    for fill in fills {
+        if fill.account_id != report.account_id
+            || fill.instrument_id != report.instrument_id
+            || fill.venue_order_id != report.venue_order_id
+            || fill.venue_position_id != report.venue_position_id
+            || Some(fill.order_side) != report.order_side
+            || fill
+                .client_order_id
+                .is_some_and(|id| Some(id) != report.client_order_id)
+            || !fill.last_qty.is_positive()
+            || !fill.last_px.is_positive()
+            || fill.ts_event > report.ts_last
+            || !ids.insert(fill.trade_id)
+        {
+            return false;
+        }
+        let Some(total) = quantity.checked_add(fill.last_qty.as_decimal()) else {
+            return false;
+        };
+        quantity = total;
+    }
+    quantity == report.filled_qty.as_decimal()
+}
+
+/// Checks that a query's complete fill history agrees with active cached executions.
+///
+/// Cached fills after the queried venue snapshot may be absent. Earlier executions must be
+/// present with identical accounting values; a query cannot replace synthetic IDs or correct
+/// history. Companion fills must not extend beyond the queried venue snapshot.
+#[must_use]
+pub fn query_fills_match_cached_history(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+) -> bool {
+    if fills.iter().any(|fill| fill.ts_event > report.ts_last) {
+        return false;
+    }
+    let active_ids = order.trade_ids();
+    order.events().iter().all(|event| {
+        let OrderEventAny::Filled(cached) = event else {
+            return true;
+        };
+
+        if !active_ids.contains(&&cached.trade_id) {
+            return true;
+        }
+
+        match fills.iter().find(|fill| fill.trade_id == cached.trade_id) {
+            Some(fill) => {
+                fill.account_id == cached.account_id
+                    && fill.instrument_id == cached.instrument_id
+                    && fill.venue_order_id == cached.venue_order_id
+                    && fill
+                        .venue_position_id
+                        .is_none_or(|id| cached.position_id == Some(id))
+                    && report
+                        .venue_position_id
+                        .is_none_or(|id| cached.position_id == Some(id))
+                    && fill.order_side == cached.order_side
+                    && fill.last_qty == cached.last_qty
+                    && fill.last_px == cached.last_px
+                    && fill.liquidity_side == cached.liquidity_side
+                    && Some(fill.commission) == cached.commission
+                    && fill.ts_event == cached.ts_event
+            }
+            None => cached.ts_event > report.ts_last,
+        }
+    })
+}
+
+/// Checks whether committed native executions satisfy a queried fill obligation.
+///
+/// An empty companion history requires contiguous native stream executions or independently
+/// complete query history covering this observation. Reconciled fragments alone cannot prove
+/// completeness. Known companion fills must match exactly; inferred fills and missing
+/// commissions never establish recovery. Only executions through the queried snapshot count.
+#[must_use]
+pub fn query_fill_recovery_complete(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+    complete_query_history: bool,
+) -> bool {
+    let complete_history = if fills.is_empty() {
+        complete_query_history
+            || committed_order_fill_evidence(order, report, fills)
+                .is_some_and(|committed| committed.iter().all(|fill| !fill.reconciliation))
+    } else {
+        query_fill_history_complete(report, fills)
+            && query_fills_match_cached_history(order, report, fills)
+    };
+    complete_history && order_fill_evidence_matches(order, report, fills)
+}
+
+/// Checks successful REST execution facts against a complete native stream prefix.
+/// Malformed evidence always retains its separate later-query requirement.
+#[must_use]
+pub fn incomplete_fill_stream_recovery_complete(
+    order: &OrderAny,
+    observed: &IncompleteFillReport,
+) -> bool {
+    let Some(snapshot) = observed.order_snapshot.as_ref() else {
+        return false;
+    };
+
+    if observed.requires_fresh_query
+        || !observed.snapshot_is_consistent()
+        || !query_fill_recovery_complete(order, snapshot, &[], false)
+    {
+        return false;
+    }
+    let Some(committed) = committed_order_fill_evidence(order, snapshot, &[]) else {
+        return false;
+    };
+    committed.iter().any(|fill| {
+        let Some(commission) = fill.commission else {
+            return false;
+        };
+
+        if observed
+            .venue_position_id
+            .is_some_and(|id| fill.position_id != Some(id))
+        {
+            return false;
+        }
+        committed
+            .iter()
+            .all(|other| observed.respects_snapshot_boundary(fill.ts_event, other.ts_event))
+            && observed.matches_fill(&FillReport::new(
+                fill.account_id,
+                fill.instrument_id,
+                fill.venue_order_id,
+                fill.trade_id,
+                fill.order_side,
+                fill.last_qty,
+                fill.last_px,
+                commission,
+                fill.liquidity_side,
+                Some(fill.client_order_id),
+                observed.venue_position_id,
+                fill.ts_event,
+                fill.ts_init,
+                Some(fill.event_id),
+            ))
+    })
+}
+
+fn committed_order_fill_evidence<'a>(
+    order: &'a OrderAny,
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+) -> Option<Vec<&'a OrderFilled>> {
+    if order.instrument_id() != report.instrument_id
+        || report
+            .client_order_id
+            .is_some_and(|id| id != order.client_order_id())
+        || report.order_side != Some(order.order_side())
+        || order.account_id() != Some(report.account_id)
+        || order.venue_order_id() != Some(report.venue_order_id)
+        || order.filled_qty() < report.filled_qty
+        || super::inferred_reconciliation_trade_ids(order).map_or(true, |ids| !ids.is_empty())
+        || fills
+            .iter()
+            .map(|fill| fill.trade_id)
+            .collect::<HashSet<_>>()
+            .len()
+            != fills.len()
+        || fills
+            .iter()
+            .any(|fill| fill.ts_event > report.ts_last || !fill_evidence_is_committed(order, fill))
+    {
+        return None;
+    }
+    let active_ids = order.trade_ids();
+    let mut committed = Vec::new();
+
+    for event in order.events() {
+        let OrderEventAny::Filled(fill) = event else {
+            continue;
+        };
+
+        if !active_ids.contains(&&fill.trade_id) || fill.ts_event > report.ts_last {
+            continue;
+        }
+
+        // Legacy OKX synthesis used this prefix without a reconciliation flag.
+        if (fill.instrument_id.venue.as_str() == "OKX"
+            && fill.trade_id.as_str().starts_with("synth-"))
+            || fill.commission.is_none()
+            || fill.account_id != report.account_id
+            || fill.instrument_id != report.instrument_id
+            || fill.venue_order_id != report.venue_order_id
+            || report
+                .venue_position_id
+                .is_some_and(|id| fill.position_id != Some(id))
+            || Some(fill.order_side) != report.order_side
+            || !fill.last_qty.is_positive()
+        {
+            return None;
+        }
+        committed.push(fill);
+    }
+    Some(committed)
+}
+
+/// Checks cumulative evidence against all committed native executions through its snapshot.
+///
+/// This cannot authorize application of missing executions.
+#[must_use]
+pub fn order_fill_evidence_matches(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+) -> bool {
+    committed_order_fill_evidence(order, report, fills).is_some_and(|committed| {
+        committed.into_iter().try_fold(Decimal::ZERO, |sum, fill| {
+            sum.checked_add(fill.last_qty.as_decimal())
+        }) == Some(report.filled_qty.as_decimal())
+    })
+}
+
+/// Checks delayed stream evidence using exact, already committed venue executions.
+///
+/// Every companion trade must match active native accounting. Executions before its last
+/// trade time are mandatory; tied executions have no venue-proven relative order. A bounded
+/// exact subset check requires independently complete query history, contiguous native stream
+/// executions, or companions accounting for the entire reported quantity. Reconciled fragments
+/// alone cannot supply completeness. This neither reorders accounting nor invents executions.
+/// Empty evidence keeps the stricter snapshot rule; arithmetic or search-bound exhaustion
+/// remains unresolved.
+#[must_use]
+pub fn stream_fill_recovery_complete(
+    order: &OrderAny,
+    report: &OrderStatusReport,
+    fills: &[FillReport],
+    complete_query_history: bool,
+) -> bool {
+    const MAX_REACHABLE_QUANTITIES: usize = 4_096;
+
+    let Some(committed) = committed_order_fill_evidence(order, report, fills) else {
+        return false;
+    };
+    let reconciled = committed.iter().any(|fill| fill.reconciliation);
+    let Some(last_time) = fills.iter().map(|fill| fill.ts_event).max() else {
+        return (complete_query_history || !reconciled)
+            && order_fill_evidence_matches(order, report, fills);
+    };
+    let mut mandatory = Decimal::ZERO;
+    let mut tied_quantities = Vec::new();
+
+    for fill in committed {
+        if fill.ts_event < last_time || fills.iter().any(|known| known.trade_id == fill.trade_id) {
+            let Some(total) = mandatory.checked_add(fill.last_qty.as_decimal()) else {
+                return false;
+            };
+            mandatory = total;
+        } else if fill.ts_event == last_time {
+            tied_quantities.push(fill.last_qty.as_decimal());
+        }
+    }
+    let target = report.filled_qty.as_decimal();
+    if mandatory >= target {
+        return mandatory == target;
+    }
+    // Only a choice among tied executions needs independent completeness proof.
+    // Earlier executions plus the exact companion are already temporally constrained.
+    if !complete_query_history && reconciled {
+        return false;
+    }
+    // Bound work independently of venue history size; exhaustion cannot establish proof.
+    let mut reachable = HashSet::from([mandatory]);
+    tied_quantities.sort_unstable_by(|a, b| b.cmp(a));
+
+    for quantity in tied_quantities {
+        let mut added = Vec::new();
+
+        for previous in &reachable {
+            let Some(total) = previous.checked_add(quantity) else {
+                return false;
+            };
+
+            if total == target {
+                return true;
+            }
+
+            if total < target {
+                added.push(total);
+            }
+        }
+
+        for total in added {
+            reachable.insert(total);
+            if reachable.len() > MAX_REACHABLE_QUANTITIES {
+                return false;
+            }
+        }
+    }
+    false
+}
 
 /// Generates reconciliation events for a live order status report.
 ///

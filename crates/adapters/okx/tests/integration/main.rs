@@ -26,4 +26,5 @@ mod exec_client;
 mod http;
 mod node;
 mod python;
+mod query_fills;
 mod websocket;

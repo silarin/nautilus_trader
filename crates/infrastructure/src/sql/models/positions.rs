@@ -73,16 +73,20 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
         let realized_return = row.try_get::<Option<f64>, _>("realized_return")?;
         let realized_pnl = row
             .try_get::<Option<&str>, _>("realized_pnl")?
-            .map(Money::from);
+            .map(decode_money_exact)
+            .transpose()?;
         let unrealized_pnl = row
             .try_get::<Option<&str>, _>("unrealized_pnl")
             .ok()
-            .and_then(|x| x.map(Money::from));
+            .flatten()
+            .map(decode_money_exact)
+            .transpose()?;
         let commissions = row
             .try_get::<Option<Vec<String>>, _>("commissions")?
-            .map_or_else(Vec::new, |c| {
-                c.into_iter().map(|s| Money::from(&s)).collect()
-            });
+            .unwrap_or_default()
+            .iter()
+            .map(|s| decode_money_exact(s))
+            .collect::<Result<Vec<_>, _>>()?;
         let duration_ns = row
             .try_get::<Option<&str>, _>("duration_ns")?
             .map(|value| {
@@ -98,9 +102,8 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
             .map(UnixNanos::from);
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let ts_last = row.try_get::<String, _>("ts_last").map(UnixNanos::from)?;
-        let replay_state = row.try_get::<Option<serde_json::Value>, _>("replay_state")?;
 
-        let snapshot = PositionSnapshot {
+        Ok(Self(PositionSnapshot {
             trader_id,
             strategy_id,
             instrument_id,
@@ -127,9 +130,11 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
             ts_closed,
             ts_last,
             ts_init,
-            replay_state,
-        };
-
-        Ok(Self(snapshot))
+            replay_state: row.try_get::<Option<serde_json::Value>, _>("replay_state")?,
+        }))
     }
+}
+
+fn decode_money_exact(value: &str) -> Result<Money, sqlx::Error> {
+    Money::from_str_exact(value).map_err(|e| sqlx::Error::Decode(e.into()))
 }

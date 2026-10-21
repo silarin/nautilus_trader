@@ -500,6 +500,18 @@ impl ExecutionClient for LiveExecutionClient {
         }
     }
 
+    fn requires_order_query_fills(&self, instrument_id: InstrumentId) -> bool {
+        self.client
+            .borrow()
+            .requires_order_query_fills(instrument_id)
+    }
+
+    fn fill_query_uses_record_time(&self, instrument_id: InstrumentId) -> bool {
+        self.client
+            .borrow()
+            .fill_query_uses_record_time(instrument_id)
+    }
+
     fn calculate_commission(
         &self,
         instrument: &InstrumentAny,

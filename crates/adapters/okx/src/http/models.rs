@@ -1233,6 +1233,12 @@ pub struct OKXOrderHistory {
     pub fee: String,
     /// Fee currency.
     pub fee_ccy: String,
+    /// Cumulative maker rebate, independently reported from fees.
+    #[serde(default)]
+    pub rebate: Option<String>,
+    /// Currency of the cumulative maker rebate.
+    #[serde(default)]
+    pub rebate_ccy: Option<String>,
     /// Filled size (optional).
     pub fill_sz: String,
     /// Fill price (optional).
@@ -1416,7 +1422,10 @@ pub struct OKXTransactionDetail {
     /// Fee amount.
     #[serde(default, deserialize_with = "deserialize_empty_string_as_none")]
     pub fee: Option<String>,
-    /// Timestamp, Unix timestamp format in milliseconds.
+    /// Actual execution time in milliseconds, when supplied by the venue.
+    #[serde(default, deserialize_with = "deserialize_optional_string_to_u64")]
+    pub fill_time: Option<u64>,
+    /// Record generation time in milliseconds.
     #[serde(deserialize_with = "deserialize_string_to_u64")]
     pub ts: u64,
 }

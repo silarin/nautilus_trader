@@ -483,7 +483,8 @@ impl Position {
         check_float_precision(fill.last_px.precision)?;
         check_float_precision(fill.last_qty.precision)?;
 
-        // Only settlement and base-currency commissions convert through `f64`
+        // Retain the existing currency precision constraints; settlement commissions
+        // use exact Money arithmetic, while base-currency quantity adjustment uses `f64`.
         if let Some(commission) = fill.commission
             && (commission.currency == self.settlement_currency
                 || (self.is_currency_pair && self.base_currency == Some(commission.currency)))
@@ -926,17 +927,37 @@ impl Position {
         indexes
     }
 
-    fn handle_buy_order_fill(&mut self, fill: &OrderFilled) {
-        // Handle case where commission could be None or not settlement currency
-        let mut realized_pnl = if let Some(commission) = fill.commission {
-            if commission.currency == self.settlement_currency {
-                -commission.as_f64()
-            } else {
-                0.0
-            }
+    fn update_realized_pnl(&mut self, gross_pnl: f64, commission: Option<Money>) {
+        let currency = self.settlement_currency;
+        let current = self.realized_pnl.unwrap_or_else(|| Money::zero(currency));
+        let commission = commission
+            .filter(|fee| fee.currency == currency)
+            .unwrap_or_else(|| Money::zero(currency));
+
+        // Exact additions must not lose subcurrency fees or overflow through f64.
+        let realized = if gross_pnl == 0.0 {
+            current.checked_sub(commission)
         } else {
-            0.0
+            // Preserve the existing arithmetic and single net-rounding operation
+            // for canonical currency amounts. Carry both exact remainders outside
+            // that operation instead of rounding gross PnL before commission.
+            let canonical_current = current.normalized();
+            let canonical_commission = commission.normalized();
+            let remainder = current.checked_sub(canonical_current).and_then(|amount| {
+                commission
+                    .checked_sub(canonical_commission)
+                    .and_then(|remainder| amount.checked_sub(remainder))
+            });
+            let net = canonical_current.as_f64() + (-canonical_commission.as_f64() + gross_pnl);
+            Money::new_checked(net, currency)
+                .ok()
+                .and_then(|amount| remainder.and_then(|remainder| amount.checked_add(remainder)))
         };
+        self.realized_pnl = Some(realized.expect("Realized PnL exceeds Money bounds"));
+    }
+
+    fn handle_buy_order_fill(&mut self, fill: &OrderFilled) {
+        let mut realized_pnl = 0.0;
 
         let last_px = fill.last_px.as_f64();
         let last_qty = fill.last_qty.as_f64();
@@ -971,11 +992,7 @@ impl Position {
                 });
         }
 
-        let current_pnl = self.realized_pnl.map_or(0.0, |p| p.as_f64());
-        self.realized_pnl = Some(Money::new(
-            current_pnl + realized_pnl,
-            self.settlement_currency,
-        ));
+        self.update_realized_pnl(realized_pnl, fill.commission);
 
         self.signed_qty += last_qty;
         self.buy_qty = self.buy_qty + last_qty_object;
@@ -991,16 +1008,7 @@ impl Position {
     }
 
     fn handle_sell_order_fill(&mut self, fill: &OrderFilled) {
-        // Handle case where commission could be None or not settlement currency
-        let mut realized_pnl = if let Some(commission) = fill.commission {
-            if commission.currency == self.settlement_currency {
-                -commission.as_f64()
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+        let mut realized_pnl = 0.0;
 
         let last_px = fill.last_px.as_f64();
         let last_qty = fill.last_qty.as_f64();
@@ -1035,11 +1043,7 @@ impl Position {
                 });
         }
 
-        let current_pnl = self.realized_pnl.map_or(0.0, |p| p.as_f64());
-        self.realized_pnl = Some(Money::new(
-            current_pnl + realized_pnl,
-            self.settlement_currency,
-        ));
+        self.update_realized_pnl(realized_pnl, fill.commission);
 
         self.signed_qty -= last_qty;
         self.sell_qty = self.sell_qty + last_qty_object;
@@ -2214,8 +2218,186 @@ mod tests {
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::{Position, PositionFillVoid, PositionReplayEvent, fold_net_position},
         stubs::*,
-        types::{Currency, Money, Price, Quantity, money::MONEY_RAW_MAX},
+        types::{
+            Currency, Money, Price, Quantity,
+            money::{MONEY_RAW_MAX, MONEY_RAW_MIN, MoneyRaw},
+        },
     };
+
+    #[rstest]
+    #[case(OrderSide::Buy, OrderSide::Sell)]
+    #[case(OrderSide::Sell, OrderSide::Buy)]
+    fn test_fractional_currency_commission_survives_position_round_trip(
+        audusd_sim: CurrencyPair,
+        #[case] opening_side: OrderSide,
+        #[case] closing_side: OrderSide,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fee = Money::from_decimal_exact(dec!(0.011995693), Currency::USD()).unwrap();
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("EXACT-1"))
+            .order_side(opening_side)
+            .last_qty(Quantity::from(2))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-EXACT"))
+            .commission(fee)
+            .build();
+        let mut position = Position::new(&instrument, opening);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.011995693)
+        );
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("EXACT-2"))
+            .order_side(closing_side)
+            .last_qty(Quantity::from(2))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-EXACT"))
+            .commission(fee)
+            .event_id(UUID4::new())
+            .build();
+        position.apply(&closing);
+        assert!(position.is_closed());
+        assert_eq!(position.commissions(), vec![fee + fee]);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.023991386)
+        );
+        position.apply(&closing);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.023991386)
+        );
+    }
+
+    #[rstest]
+    #[case(MONEY_RAW_MAX, -1.0)]
+    #[case(MONEY_RAW_MIN, 1.0)]
+    #[should_panic(expected = "Realized PnL exceeds Money bounds")]
+    fn test_fractional_currency_commission_retains_pnl_bounds(
+        audusd_sim: CurrencyPair,
+        #[case] raw: MoneyRaw,
+        #[case] commission: f64,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(PositionId::from("P-BOUND"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let mut position = Position::new(&instrument, fill);
+        position.realized_pnl = Some(Money::from_raw(raw, Currency::USD()));
+        position.update_realized_pnl(0.0, Some(Money::new(commission, Currency::USD())));
+    }
+
+    #[rstest]
+    #[case(0.0, 0.125, 0.13)]
+    #[case(0.0, -0.125, -0.13)]
+    #[case(0.31, 0.125, 0.13)]
+    #[case(-0.31, -0.125, -0.13)]
+    #[case(0.0, -0.125, 0.13)]
+    #[case(0.0, 0.125, -0.13)]
+    fn test_realized_pnl_preserves_canonical_net_rounding(
+        audusd_sim: CurrencyPair,
+        #[case] prior: f64,
+        #[case] gross: f64,
+        #[case] fee: f64,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(PositionId::from("P-ROUND"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let mut position = Position::new(&instrument, fill);
+        let prior = Money::new(prior, Currency::USD());
+        let fee = Money::new(fee, Currency::USD());
+        position.realized_pnl = Some(prior);
+        position.update_realized_pnl(gross, Some(fee));
+        let expected = Money::new(prior.as_f64() + (-fee.as_f64() + gross), Currency::USD());
+        assert_eq!(position.realized_pnl, Some(expected));
+    }
+
+    #[rstest]
+    #[case(0.125, dec!(0.001995693), dec!(0.003100001))]
+    #[case(-0.125, dec!(-0.001995693), dec!(0.003100001))]
+    fn test_realized_pnl_carries_both_exact_fee_remainders(
+        audusd_sim: CurrencyPair,
+        #[case] gross: f64,
+        #[case] prior_remainder: Decimal,
+        #[case] fee_remainder: Decimal,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(PositionId::from("P-REMAINDER"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let mut position = Position::new(&instrument, fill);
+        let prior =
+            Money::from_decimal_exact(dec!(0.31) + prior_remainder, Currency::USD()).unwrap();
+        let fee = Money::from_decimal_exact(dec!(0.13) + fee_remainder, Currency::USD()).unwrap();
+        position.realized_pnl = Some(prior);
+        position.update_realized_pnl(gross, Some(fee));
+        let expected = Money::new(0.31 + (-0.13 + gross), Currency::USD()).as_decimal()
+            + prior_remainder
+            - fee_remainder;
+        assert_eq!(position.realized_pnl.unwrap().as_decimal(), expected);
+        position.update_realized_pnl(0.0, Some(fee));
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            expected - fee.as_decimal()
+        );
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy, OrderSide::Sell, "1.12500")]
+    #[case(OrderSide::Sell, OrderSide::Buy, "0.87500")]
+    fn test_fractional_fees_and_net_rounding_survive_fill_replay(
+        audusd_sim: CurrencyPair,
+        #[case] opening_side: OrderSide,
+        #[case] closing_side: OrderSide,
+        #[case] closing_price: &str,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("ROUND-1"))
+            .order_side(opening_side)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-ROUND-REPLAY"))
+            .commission(Money::from_decimal_exact(dec!(0.011995693), Currency::USD()).unwrap())
+            .build();
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("ROUND-2"))
+            .order_side(closing_side)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from(closing_price))
+            .position_id(PositionId::from("P-ROUND-REPLAY"))
+            .commission(Money::from_decimal_exact(dec!(0.133100001), Currency::USD()).unwrap())
+            .event_id(UUID4::new())
+            .build();
+        let encoded = rmp_serde::to_vec_named(&vec![opening.clone(), closing.clone()]).unwrap();
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&closing);
+        assert!(position.is_closed());
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.025095694)
+        );
+        assert_eq!(position.commissions()[0].as_decimal(), dec!(0.145095694));
+        let mut recovered: Vec<OrderFilled> = rmp_serde::from_slice(&encoded).unwrap();
+        let mut replayed = Position::new(&instrument, recovered.remove(0));
+        replayed.apply(&recovered[0]);
+        assert_eq!(replayed.realized_pnl, position.realized_pnl);
+        assert_eq!(replayed.commissions(), position.commissions());
+        replayed.apply(&recovered[0]);
+        assert_eq!(replayed.realized_pnl, position.realized_pnl);
+    }
 
     #[rstest]
     fn test_same_trade_id_new_price_restates_position_average(audusd_sim: CurrencyPair) {

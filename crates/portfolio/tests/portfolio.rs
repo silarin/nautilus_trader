@@ -6509,17 +6509,24 @@ fn test_realized_pnl_for_closed_cached_netting_position_uses_mark_xrate(
 }
 
 #[rstest]
+#[case("16.00 USD", "6.00 USD", "22.00 USD", false)]
+#[case("-0.011995693 USD", "-0.011995693 USD", "-0.023991386 USD", false)]
+#[case("-0.011995693 USD", "-0.011995693 USD", "-0.023991386 USD", true)]
 fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
     mut simple_cache: Cache,
     clock: VirtualClock,
     instrument_audusd: InstrumentAny,
+    #[case] first: &str,
+    #[case] second: &str,
+    #[case] expected: &str,
+    #[case] same_currency_conversion: bool,
 ) {
     simple_cache
         .add_instrument(instrument_audusd.clone())
         .unwrap();
     simple_cache.set_mark_xrate(Currency::USD(), Currency::EUR(), 0.5);
     let config = PortfolioConfig::builder()
-        .convert_to_account_base_currency(false)
+        .convert_to_account_base_currency(same_currency_conversion)
         .build()
         .unwrap();
     let mut portfolio = Portfolio::new(
@@ -6542,7 +6549,11 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
         UUID4::new(),
         UnixNanos::default(),
         UnixNanos::default(),
-        Some(Currency::EUR()),
+        Some(if same_currency_conversion {
+            Currency::USD()
+        } else {
+            Currency::EUR()
+        }),
     ));
 
     add_closed_netting_position_with_snapshots(
@@ -6550,8 +6561,11 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
         &instrument_audusd,
         account_id,
         PositionId::new("P-CLOSED-CACHED-NO-CONVERT"),
-        &[Money::from("16.00 USD"), Money::from("6.00 USD")],
-        Money::from("6.00 USD"),
+        &[
+            Money::from_str_exact(first).unwrap(),
+            Money::from_str_exact(second).unwrap(),
+        ],
+        Money::from_str_exact(second).unwrap(),
     );
 
     let pnl = portfolio
@@ -6560,7 +6574,7 @@ fn test_realized_pnl_for_closed_cached_netting_position_without_base_conversion(
 
     // Conversion is disabled, so the amounts stay at face value rather than halving, and stay
     // keyed by the position cost currency rather than the account base currency.
-    assert_eq!(pnl, Money::from("22.00 USD"));
+    assert_eq!(pnl, Money::from_str_exact(expected).unwrap());
 }
 
 #[rstest]

@@ -18930,6 +18930,7 @@ fn open_external_audusd_position(
 fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
     mut execution_engine: ExecutionEngine,
     #[case] reconciliation_opened: bool,
+    #[values(false, true)] queried: bool,
     #[case] replay_ts_event: u64,
     #[case] expected_qty: Decimal,
     #[case] expected_replay_on_position: bool,
@@ -18949,9 +18950,35 @@ fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
         Price::from("1.00000"),
     );
     replayed.ts_event = UnixNanos::from(replay_ts_event);
-    execution_engine.reconcile_fill_report(&replayed);
+
+    if queried {
+        let report = create_order_status_report(
+            None,
+            replay_venue_order_id,
+            instrument.id(),
+            OrderStatus::Filled,
+            Quantity::from(100_000),
+            Quantity::from(100_000),
+        );
+        execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(report),
+            vec![replayed],
+        ));
+    } else {
+        execution_engine.reconcile_fill_report(&replayed);
+    }
 
     let cache = execution_engine.cache().borrow();
+    if queried
+        && ((!reconciliation_opened && replay_ts_event < 9_000_000) || replay_ts_event == 9_000_000)
+    {
+        assert!(cache.client_order_id(&replay_venue_order_id).is_none());
+        let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].signed_decimal_qty(), dec!(100_000));
+        assert!(!positions[0].trade_ids.contains(&replay_trade_id));
+        return;
+    }
     let replay_client_order_id = cache
         .client_order_id(&replay_venue_order_id)
         .copied()
@@ -22942,6 +22969,163 @@ fn test_reconcile_order_with_fills_infers_residual_gap(mut execution_engine: Exe
 }
 
 #[rstest]
+fn test_order_query_with_fills_rejects_conflicting_canonical_side(
+    mut execution_engine: ExecutionEngine,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let client_order_id = order.client_order_id();
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from(100_000),
+        Quantity::from(100_000),
+    );
+    report.order_side = Some(OrderSide::Sell);
+    let mut fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("WRONG-SIDE"),
+        Quantity::from(100_000),
+        Price::from("1.00000"),
+    );
+    fill.order_side = OrderSide::Sell;
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report),
+        vec![fill],
+    ));
+    let cache = execution_engine.cache().borrow();
+    let unchanged = cache.order(&client_order_id).unwrap();
+    assert_eq!(unchanged.events(), order.events());
+    assert!(unchanged.filled_qty().is_zero());
+    assert!(cache.positions(None, None, None, None, None).is_empty());
+}
+
+#[rstest]
+#[case("matching", Some(OrderStatus::Accepted))]
+#[case("canceled", Some(OrderStatus::Canceled))]
+#[case("side", None)]
+#[case("account", None)]
+#[case("instrument", None)]
+#[case("venue_owner", None)]
+#[case("filled_without_history", None)]
+#[case("known_venue_conflict", None)]
+fn test_zero_fill_query_validates_missing_acceptance_identity(
+    mut execution_engine: ExecutionEngine,
+    #[case] case: &str,
+    #[case] expected: Option<OrderStatus>,
+) {
+    let (instrument, order) = prepare_initialized_order_with_account(
+        &execution_engine,
+        CashAccount::default().into(),
+        OrderType::Limit,
+    );
+    let client_order_id = order.client_order_id();
+    let venue_order_id = VenueOrderId::from("V-RECOVERED");
+    execution_engine.process(&TestOrderEventStubs::submitted(
+        &order,
+        AccountId::test_default(),
+    ));
+    let mut report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        expected.unwrap_or(OrderStatus::Accepted),
+        order.quantity(),
+        Quantity::from(0),
+    );
+
+    match case {
+        "side" => report.order_side = Some(OrderSide::Sell),
+        "account" => report.account_id = AccountId::from("OTHER-001"),
+        "instrument" => report.instrument_id = InstrumentId::from("OTHER.SIM"),
+        "venue_owner" => execution_engine
+            .cache()
+            .borrow_mut()
+            .add_venue_order_id(&ClientOrderId::from("OTHER-ORDER"), &venue_order_id, false)
+            .unwrap(),
+        "filled_without_history" => report.filled_qty = Quantity::from(1),
+        "known_venue_conflict" => execution_engine.process(&TestOrderEventStubs::accepted(
+            &order,
+            AccountId::test_default(),
+            VenueOrderId::from("V-ORIGINAL"),
+        )),
+        _ => {}
+    }
+    let before = cached_order_or(&execution_engine, &order);
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report),
+        Vec::new(),
+    ));
+    let cache = execution_engine.cache().borrow();
+    let recovered = cache.order(&client_order_id).unwrap();
+
+    if let Some(expected) = expected {
+        assert_eq!(recovered.status(), expected);
+        assert_eq!(recovered.venue_order_id(), Some(venue_order_id));
+        assert_eq!(
+            cache.client_order_id(&venue_order_id),
+            Some(&client_order_id)
+        );
+    } else {
+        assert_eq!(recovered.events(), before.events());
+    }
+    assert!(recovered.filled_qty().is_zero());
+    assert!(recovered.trade_ids().is_empty());
+    assert!(cache.positions(None, None, None, None, None).is_empty());
+}
+
+#[rstest]
+fn test_order_query_with_fills_does_not_infer_residual_gap(mut execution_engine: ExecutionEngine) {
+    let instrument = audusd_sim();
+    execution_engine
+        .cache()
+        .borrow_mut()
+        .add_instrument(instrument.clone().into())
+        .unwrap();
+
+    let client_order_id = ClientOrderId::from("adl_autoclose-002");
+    let venue_order_id = VenueOrderId::from("V-BUNDLED-002");
+    let real_trade_id = TradeId::from("T-REAL-002");
+
+    let order_report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from(100_000),
+        Quantity::from(100_000),
+    );
+
+    // Missing authoritative quantity must remain unresolved
+    let real_fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        real_trade_id,
+        Quantity::from(70_000),
+        Price::from("1.00000"),
+    );
+
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(order_report),
+        vec![real_fill],
+    ));
+
+    let cache = execution_engine.cache().borrow();
+    let order = cache
+        .order(&client_order_id)
+        .expect("external order should be in cache");
+    assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(order.filled_qty(), Quantity::from(70_000));
+    assert_eq!(order.trade_ids().len(), 1);
+    assert!(order.trade_ids().iter().any(|id| **id == real_trade_id));
+}
+
+#[rstest]
 fn test_reconcile_order_with_fills_uses_cached_order_side_when_status_side_missing(
     mut execution_engine: ExecutionEngine,
 ) {
@@ -23065,6 +23249,146 @@ fn test_reconcile_order_with_fills_applies_companion_fill_before_void_correction
     assert_eq!(corrected_order.voided_qty(), Quantity::from(20_000));
     assert_eq!(corrected_position.quantity, Quantity::from(50_000));
     assert_eq!(corrected_position.fill_voids.len(), 2);
+}
+
+#[rstest]
+#[case("identity")]
+#[case("price")]
+#[case("quantity")]
+#[case("commission")]
+#[case("time")]
+#[case("future")]
+fn test_order_query_rejects_conflicting_cached_fill_history(
+    mut execution_engine: ExecutionEngine,
+    #[case] conflict: &str,
+) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let client_order_id = order.client_order_id();
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::PartiallyFilled,
+        Quantity::from(100_000),
+        Quantity::from(40_000),
+    );
+    let mut cached_fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("CACHED"),
+        Quantity::from(40_000),
+        Price::from("1.00000"),
+    );
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report.clone()),
+        vec![cached_fill.clone()],
+    ));
+    let before = execution_engine
+        .cache()
+        .borrow()
+        .order_owned(&client_order_id)
+        .unwrap();
+    assert_eq!(before.filled_qty(), Quantity::from(40_000));
+    let mut new_fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("NEW"),
+        Quantity::from(20_000),
+        Price::from("1.00000"),
+    );
+
+    match conflict {
+        "identity" => cached_fill.trade_id = TradeId::from("DIFFERENT"),
+        "price" => cached_fill.last_px = Price::from("1.10000"),
+        "quantity" => {
+            cached_fill.last_qty = Quantity::from(30_000);
+            new_fill.last_qty = Quantity::from(30_000);
+        }
+        "commission" => cached_fill.commission = Money::from("0.20 USD"),
+        "time" => cached_fill.ts_event = UnixNanos::from(999_999),
+        "future" => new_fill.ts_event = UnixNanos::from(1_000_001),
+        _ => unreachable!(),
+    }
+    report.filled_qty = Quantity::from(60_000);
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report),
+        vec![cached_fill, new_fill],
+    ));
+    let cache = execution_engine.cache().borrow();
+    assert_eq!(
+        cache.order(&client_order_id).unwrap().events(),
+        before.events()
+    );
+    assert_eq!(
+        cache.positions(None, None, None, None, None)[0].quantity,
+        Quantity::from(40_000)
+    );
+}
+
+#[rstest]
+fn test_order_query_with_fills_does_not_void_newer_fills(mut execution_engine: ExecutionEngine) {
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let client_order_id = order.client_order_id();
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut initial_fill = build_order_filled(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        client_order_id,
+        venue_order_id,
+        AccountId::test_default(),
+        TradeId::from("T-BUNDLED-INITIAL"),
+        order.order_side(),
+        order.order_type(),
+        Quantity::from(60_000),
+        Price::from("1.00000"),
+        instrument.quote_currency(),
+        LiquiditySide::Taker,
+        None,
+        None,
+    );
+    initial_fill.ts_event = UnixNanos::from(2_000_000);
+    execution_engine.process(&OrderEventAny::Filled(initial_fill));
+    let position_id = *execution_engine
+        .cache()
+        .borrow()
+        .position_ids(None, None, None, None)
+        .iter()
+        .next()
+        .expect("initial fill should open a position");
+    let companion_fill = create_fill_report(
+        instrument.id(),
+        Some(client_order_id),
+        venue_order_id,
+        TradeId::from("T-BUNDLED-COMPANION"),
+        Quantity::from(10_000),
+        Price::from("1.00000"),
+    );
+    let report = create_order_status_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::PartiallyFilled,
+        Quantity::from(100_000),
+        Quantity::from(10_000),
+    );
+
+    execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+        Box::new(report),
+        vec![companion_fill],
+    ));
+
+    let cache = execution_engine.cache().borrow();
+    let corrected_order = cache.order(&client_order_id).unwrap();
+    let corrected_position = cache.position(&position_id).unwrap();
+    assert_eq!(corrected_order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(corrected_order.filled_qty(), Quantity::from(60_000));
+    assert_eq!(corrected_order.voided_qty(), Quantity::from(0));
+    assert_eq!(corrected_position.quantity, Quantity::from(60_000));
+    assert_eq!(corrected_position.fill_voids.len(), 0);
 }
 
 #[rstest]
@@ -23347,6 +23671,7 @@ fn test_reconcile_order_with_fills_emits_terminal_event_for_external(
 #[case::zero_then_valid(true)]
 fn test_reconcile_order_with_fills_applies_multiple_fills(
     mut execution_engine: ExecutionEngine,
+    #[values(false, true)] queried: bool,
     #[case] zero_first: bool,
 ) {
     let instrument = audusd_sim();
@@ -23398,7 +23723,14 @@ fn test_reconcile_order_with_fills_applies_multiple_fills(
 
     fills.extend([fill_a, fill_b]);
 
-    execution_engine.reconcile_order_with_fills(&order_report, &fills);
+    if queried {
+        execution_engine.reconcile_execution_report(&ExecutionReport::OrderQueryWithFills(
+            Box::new(order_report),
+            fills,
+        ));
+    } else {
+        execution_engine.reconcile_order_with_fills(&order_report, &fills);
+    }
 
     let cache = execution_engine.cache().borrow();
     let order = cache
@@ -24987,4 +25319,255 @@ fn test_execution_command_logging(
 
     assert_eq!(take_reconciliation_logs(), expected);
     assert_eq!(*calls.borrow(), vec![(client_id, operation)]);
+}
+
+#[rstest]
+#[case::matching_venue_position("matching")]
+#[case::native_net_position("net")]
+#[case::conflicting_status_position("status")]
+#[case::conflicting_fill_position("fill")]
+#[case::conflicting_cached_position("cached")]
+fn test_query_fill_evidence_preserves_venue_position_identity(#[case] case: &str) {
+    use nautilus_execution::reconciliation::{
+        order_fill_evidence_matches, query_fill_evidence_matches, query_fill_history_complete,
+        query_fill_recovery_complete, query_fills_match_cached_history,
+    };
+
+    let instrument = audusd_sim();
+    let long = PositionId::from("AUDUSD-LONG");
+    let short = PositionId::from("AUDUSD-SHORT");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .quantity(Quantity::from(100_000))
+        .side(OrderSide::Buy)
+        .build();
+    let account = AccountId::test_default();
+    let venue_order = VenueOrderId::from("V-POSITION-EVIDENCE");
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(&order, account, venue_order))
+        .unwrap();
+    let fill = build_order_filled(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        order.client_order_id(),
+        venue_order,
+        account,
+        TradeId::from("T-POSITION-EVIDENCE"),
+        OrderSide::Buy,
+        OrderType::Market,
+        order.quantity(),
+        Price::from("1.00000"),
+        Currency::USD(),
+        LiquiditySide::Taker,
+        Some(if case == "cached" { short } else { long }),
+        Some(Money::from("0.01 USD")),
+    );
+    order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+    let mut status = create_order_status_report(
+        Some(order.client_order_id()),
+        venue_order,
+        instrument.id(),
+        OrderStatus::Filled,
+        order.quantity(),
+        order.quantity(),
+    );
+    status.account_id = account;
+    status.ts_last = fill.ts_event;
+    status.venue_position_id = (case != "net").then_some(long);
+    let mut report = FillReport::new(
+        account,
+        instrument.id(),
+        venue_order,
+        fill.trade_id,
+        fill.order_side,
+        fill.last_qty,
+        fill.last_px,
+        fill.commission.unwrap(),
+        fill.liquidity_side,
+        Some(order.client_order_id()),
+        status.venue_position_id,
+        fill.ts_event,
+        fill.ts_init,
+        None,
+    );
+    let original_status = status.clone();
+    let original_report = report.clone();
+
+    if case == "status" {
+        status.venue_position_id = Some(short);
+    } else if case == "fill" {
+        report.venue_position_id = Some(short);
+    }
+    let compatible = matches!(case, "matching" | "net");
+    assert_eq!(
+        query_fill_history_complete(&status, std::slice::from_ref(&report)),
+        case != "status" && case != "fill"
+    );
+    assert_eq!(
+        query_fills_match_cached_history(&order, &status, std::slice::from_ref(&report)),
+        compatible
+    );
+    assert_eq!(
+        query_fill_recovery_complete(&order, &status, std::slice::from_ref(&report), false),
+        compatible
+    );
+    assert_eq!(
+        order_fill_evidence_matches(&order, &status, std::slice::from_ref(&report)),
+        compatible
+    );
+    assert_eq!(
+        query_fill_evidence_matches(&original_status, &[original_report], &status, &[report]),
+        case != "status" && case != "fill",
+    );
+}
+
+#[rstest]
+fn test_fill_evidence_resolves_optional_client_ids(
+    mut execution_engine: ExecutionEngine,
+    #[values("matching", "missing", "conflict")] left_id: &str,
+    #[values("matching", "missing", "conflict")] right_id: &str,
+    #[values("", "account", "instrument", "venue", "side")] wrong_order: &str,
+) {
+    use nautilus_execution::reconciliation::{
+        fill_evidence_matches, fill_evidence_matches_with_order,
+    };
+
+    let (instrument, order) = prepare_accepted_order(&mut execution_engine);
+    let mut left = create_fill_report(
+        instrument.id(),
+        Some(order.client_order_id()),
+        order.venue_order_id().unwrap(),
+        TradeId::from("VENUE-EXECUTION"),
+        Quantity::from(40_000),
+        Price::from("1.00000"),
+    );
+
+    match wrong_order {
+        "account" => left.account_id = AccountId::from("OTHER-001"),
+        "instrument" => left.instrument_id = InstrumentId::from("EURUSD.SIM"),
+        "venue" => left.venue_order_id = VenueOrderId::from("OTHER-VENUE"),
+        "side" => left.order_side = OrderSide::Sell,
+        "" => {}
+        _ => unreachable!(),
+    }
+    let mut right = left.clone();
+
+    for (fill, identity) in [(&mut left, left_id), (&mut right, right_id)] {
+        fill.client_order_id = match identity {
+            "matching" => Some(order.client_order_id()),
+            "missing" => None,
+            "conflict" => Some(ClientOrderId::from("OTHER-CLIENT")),
+            _ => unreachable!(),
+        };
+    }
+    assert_eq!(fill_evidence_matches(&left, &right), left_id == right_id);
+    let compatible = wrong_order.is_empty() && left_id != "conflict" && right_id != "conflict";
+    assert_eq!(
+        fill_evidence_matches_with_order(&order, &left, &right),
+        compatible
+    );
+    assert_eq!(
+        fill_evidence_matches_with_order(&order, &right, &left),
+        compatible
+    );
+}
+
+#[rstest]
+#[case::unproven_fragments(false, false)]
+#[case::complete_query(true, true)]
+fn test_tied_stream_evidence_requires_complete_history(
+    #[case] complete_query: bool,
+    #[case] expected: bool,
+) {
+    use nautilus_execution::reconciliation::stream_fill_recovery_complete;
+
+    let instrument = audusd_sim();
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .quantity(Quantity::from("1.0"))
+        .side(OrderSide::Buy)
+        .build();
+    let account = AccountId::test_default();
+    let venue_order = VenueOrderId::from("V-TIED-EVIDENCE");
+    order
+        .apply(TestOrderEventStubs::submitted(&order, account))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(&order, account, venue_order))
+        .unwrap();
+    let mut companion = None;
+    // A=0.3 is missing. C=0.3 and B=0.1 could accidentally match B's true
+    // cumulative 0.4; matching a subset cannot supply history completeness.
+    for (trade, quantity) in [("C", "0.3"), ("D", "0.2"), ("B", "0.1")] {
+        let mut fill = build_order_filled(
+            order.trader_id(),
+            order.strategy_id(),
+            instrument.id(),
+            order.client_order_id(),
+            venue_order,
+            account,
+            TradeId::from(trade),
+            OrderSide::Buy,
+            OrderType::Market,
+            Quantity::from(quantity),
+            Price::from("1.00000"),
+            Currency::USD(),
+            LiquiditySide::Taker,
+            None,
+            Some(Money::from("0.01 USD")),
+        );
+        fill.reconciliation = true;
+        fill.ts_event = UnixNanos::from(100);
+
+        if trade == "B" {
+            companion = Some(FillReport::new(
+                account,
+                instrument.id(),
+                venue_order,
+                fill.trade_id,
+                fill.order_side,
+                fill.last_qty,
+                fill.last_px,
+                fill.commission.unwrap(),
+                fill.liquidity_side,
+                Some(order.client_order_id()),
+                None,
+                fill.ts_event,
+                fill.ts_init,
+                None,
+            ));
+        }
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+    }
+    let mut status = create_order_status_report(
+        Some(order.client_order_id()),
+        venue_order,
+        instrument.id(),
+        OrderStatus::PartiallyFilled,
+        order.quantity(),
+        Quantity::from("0.4"),
+    );
+    status.account_id = account;
+    status.ts_last = UnixNanos::from(100);
+    let companion = companion.unwrap();
+    assert_eq!(
+        stream_fill_recovery_complete(
+            &order,
+            &status,
+            std::slice::from_ref(&companion),
+            complete_query
+        ),
+        expected
+    );
+    status.filled_qty = Quantity::from("0.45");
+    assert!(!stream_fill_recovery_complete(
+        &order,
+        &status,
+        &[companion],
+        true
+    ));
 }

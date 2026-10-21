@@ -17,6 +17,7 @@ use std::fmt::{Debug, Display};
 
 use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
+use ruint::aliases::U256;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -31,7 +32,7 @@ use crate::{
         AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
         StrategyId, TradeId, TraderId, VenueOrderId,
     },
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money, Price, Quantity, money::MoneyRaw},
 };
 
 #[repr(C)]
@@ -155,6 +156,9 @@ impl OrderFilled {
     /// Splits an overfill into the fragment which closes the current position and the
     /// fragment which opens the flipped position.
     ///
+    /// Commission allocation rounds the closing share toward zero at native storage precision;
+    /// the opening share retains the exact remainder, preserving the total and sign.
+    ///
     /// # Errors
     ///
     /// Returns an error if `closing_qty` is zero, is not smaller than the fill quantity, or the
@@ -177,13 +181,16 @@ impl OrderFilled {
             .checked_sub(closing_qty)
             .ok_or_else(|| anyhow::anyhow!("fill quantities have incompatible scales"))?;
         opening_qty.precision = closing_qty.precision;
-        let closing_fraction = closing_qty.as_decimal() / self.last_qty.as_decimal();
         let (closing_commission, opening_commission) = match self.commission {
             Some(commission) => {
-                let closing = Money::from_decimal(
-                    commission.as_decimal() * closing_fraction,
-                    commission.currency,
-                )?;
+                // Full-width multiplication preserves valid raw quantities without intermediate
+                // overflow; division assigns any indivisible native unit to the opening leg.
+                let magnitude = U256::from(commission.raw().unsigned_abs())
+                    * U256::from(closing_qty.raw)
+                    / U256::from(self.last_qty.raw);
+                let closing_raw =
+                    MoneyRaw::try_from(magnitude.to::<u128>())? * commission.raw().signum();
+                let closing = Money::from_raw_checked(closing_raw, commission.currency)?;
                 (Some(closing), Some(commission - closing))
             }
             None => (None, None),
@@ -486,7 +493,7 @@ mod tests {
         enums::OrderSide,
         events::order::stubs::*,
         identifiers::PositionId,
-        types::{Currency, Money, Price, Quantity},
+        types::{Currency, Money, Price, Quantity, money::MoneyRaw},
     };
 
     fn create_test_order_filled() -> OrderFilled {
@@ -585,6 +592,72 @@ mod tests {
         assert_eq!(opening.event_id, opening_event_id);
         assert_eq!(opening.causation_id, Some(source_event_id));
         assert_eq!(opening.commission, Some(Money::new(1.5, Currency::USD())));
+    }
+
+    #[rstest]
+    #[case("0.006", "0.0054", "0.0006")]
+    #[case("-0.006", "-0.0054", "-0.0006")]
+    #[case("0.01", "0.009", "0.001")]
+    #[case("0", "0", "0")]
+    fn test_position_flip_retains_exact_commission(
+        #[case] total: &str,
+        #[case] closing_fee: &str,
+        #[case] opening_fee: &str,
+    ) {
+        let exact = |value: &str| {
+            Money::from_decimal_exact(value.parse().unwrap(), Currency::USD()).unwrap()
+        };
+        let (total, closing_fee, opening_fee) =
+            (exact(total), exact(closing_fee), exact(opening_fee));
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from("2.0");
+        fill.commission = Some(total);
+        let (closing, opening) = fill
+            .split_for_position_flip(Quantity::from("1.8"), None, UUID4::new())
+            .unwrap();
+        assert_eq!(closing.commission, Some(closing_fee));
+        assert_eq!(opening.commission, Some(opening_fee));
+        assert_eq!(closing_fee + opening_fee, total);
+
+        for fragment in [closing, opening] {
+            let encoded = rmp_serde::to_vec_named(&fragment).unwrap();
+            let restored: OrderFilled = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(restored, fragment);
+        }
+    }
+
+    #[rstest]
+    fn test_position_flip_allocates_indivisible_native_units_without_overflow(
+        #[values(1, -1)] sign: MoneyRaw,
+        #[values(false, true)] full_range: bool,
+    ) {
+        use crate::types::{
+            fixed::FIXED_PRECISION, money::MONEY_RAW_MAX, quantity::QUANTITY_RAW_MAX,
+        };
+        let total = Money::from_raw(
+            sign * if full_range { MONEY_RAW_MAX } else { 1 },
+            Currency::USD(),
+        );
+        let denominator = if full_range { QUANTITY_RAW_MAX } else { 3 };
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from_raw(denominator, FIXED_PRECISION);
+        fill.commission = Some(total);
+        let (closing, opening) = fill
+            .split_for_position_flip(
+                Quantity::from_raw(denominator - 1, FIXED_PRECISION),
+                None,
+                UUID4::new(),
+            )
+            .unwrap();
+        let closing = closing.commission.unwrap();
+        let opening = opening.commission.unwrap();
+        assert_eq!(closing + opening, total);
+        assert!(closing.raw() == 0 || closing.raw().signum() == sign);
+        assert!(opening.raw() == 0 || opening.raw().signum() == sign);
+        let allocated = U256::from(closing.raw().unsigned_abs()) * U256::from(denominator);
+        let ideal = U256::from(total.raw().unsigned_abs()) * U256::from(denominator - 1);
+        assert!(allocated <= ideal);
+        assert!(ideal - allocated < U256::from(denominator));
     }
 
     #[rstest]

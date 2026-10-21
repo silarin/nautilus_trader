@@ -449,7 +449,18 @@ async fn submission_exhaustion_and_late_evidence(
     })
     .await
     .unwrap();
-    result.unwrap();
+    if retain {
+        result.unwrap();
+    } else {
+        // Default rejection remains unchanged; a subsequently observed venue fill
+        // that cannot apply must prevent a false claim of complete shutdown.
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Order fill recovery incomplete")
+        );
+    }
     msgbus::unsubscribe_any(topic.into(), &handler);
     let diagnostics = diagnostics.get_messages();
     assert_eq!(diagnostics.len(), usize::from(retain));

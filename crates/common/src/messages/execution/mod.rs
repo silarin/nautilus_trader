@@ -16,6 +16,7 @@
 //! Execution specific messages such as order commands.
 
 pub mod cancel;
+pub mod fees;
 pub mod modify;
 pub mod query;
 pub mod report;
@@ -25,14 +26,21 @@ use std::fmt::Display;
 
 use nautilus_core::{Params, UnixNanos};
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, StrategyId},
+    enums::{LiquiditySide, OrderSide},
+    identifiers::{
+        AccountId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId,
+        VenueOrderId,
+    },
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    types::Currency,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use strum::Display as StrumDisplay;
 
 pub use self::{
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
+    fees::{CommissionBasis, CumulativeCommissionConstraint, OrderFeeEvidence, OrderFeeOrigin},
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
     report::{
@@ -47,12 +55,220 @@ pub use self::{
 /// Parameter indicating that a conditional order should close the whole position at trigger time.
 pub const PARAMS_CLOSE_POSITION: &str = "close_position";
 
+/// Maximum distinct incomplete execution obligations retained for one native venue order.
+/// Exhaustion must prevent recovery rather than discard facts and accept later accounting.
+pub const MAX_INCOMPLETE_FILL_OBSERVATIONS: usize = 4096;
+
+/// Independently parsed execution facts which require complete native recovery.
+/// Missing fields are unknown, never zero-valued economic facts. Without a trade ID,
+/// this evidence cannot resolve automatically because its execution cannot be identified.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IncompleteFillReport {
+    /// Account which observed the execution.
+    pub account_id: AccountId,
+    /// Native instrument identity.
+    pub instrument_id: InstrumentId,
+    /// Venue order whose execution needs recovery.
+    pub venue_order_id: VenueOrderId,
+    /// Client identity when independently known.
+    pub client_order_id: Option<ClientOrderId>,
+    /// Venue trade identity when independently known.
+    pub trade_id: Option<TradeId>,
+    /// Observed order side.
+    pub order_side: OrderSide,
+    /// Exact parsed quantity, including values not representable on the instrument grid.
+    pub last_qty: Option<Decimal>,
+    /// Exact parsed price, without rounding.
+    pub last_px: Option<Decimal>,
+    /// Independently known per-fill commission amount, without native money rounding.
+    pub commission_amount: Option<Decimal>,
+    /// Independently known commission currency; cumulative fees do not qualify.
+    pub commission_currency: Option<Currency>,
+    /// Numeric facts exceed exact representation; no later query can resolve this evidence.
+    pub unrepresentable_values: bool,
+    /// Malformed evidence requires a later query; successful query facts allow that query.
+    pub requires_fresh_query: bool,
+    /// Originating successful REST snapshot, including its execution boundary.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub order_snapshot: Option<Box<OrderStatusReport>>,
+    /// Independently known liquidity role.
+    pub liquidity_side: Option<LiquiditySide>,
+    /// Native venue position mapping.
+    pub venue_position_id: Option<PositionId>,
+    /// Venue execution time when provided.
+    pub ts_event: Option<UnixNanos>,
+    /// Observation time, or query start time for successful query facts.
+    pub ts_init: UnixNanos,
+}
+
+impl IncompleteFillReport {
+    /// Returns the native order scope independently of optional client identity.
+    #[must_use]
+    pub fn order_key(&self) -> (AccountId, InstrumentId, VenueOrderId) {
+        (self.account_id, self.instrument_id, self.venue_order_id)
+    }
+
+    /// Compares retained facts, excluding receipt metadata while preserving snapshot boundaries.
+    #[must_use]
+    pub fn same_observed_facts(&self, other: &Self) -> bool {
+        if !self.snapshot_is_consistent() || !other.snapshot_is_consistent() {
+            return false;
+        }
+        let mut comparable = other.clone();
+        comparable.ts_init = self.ts_init;
+        if let (Some(snapshot), Some(previous)) =
+            (&self.order_snapshot, &mut comparable.order_snapshot)
+        {
+            previous.ts_init = snapshot.ts_init;
+            previous.report_id = snapshot.report_id;
+        }
+        self == &comparable
+    }
+
+    /// Whether this later-received malformed observation implies earlier recovery freshness.
+    /// Admission still requires the earliest observation time; this alone cannot authorize removal.
+    #[must_use]
+    pub fn supersedes_malformed_observation(&self, earlier: &Self) -> bool {
+        self.requires_fresh_query
+            && self.ts_init >= earlier.ts_init
+            && self.same_observed_facts(earlier)
+    }
+
+    /// Selects redundant earlier observations while preserving admission and recovery constraints.
+    /// The actual minimum-time report still constrains queries started before this new receipt.
+    #[must_use]
+    pub fn superseded_malformed_observation_indices<'a>(
+        &self,
+        observations: impl Iterator<Item = (usize, &'a Self)>,
+    ) -> Vec<usize> {
+        let superseded: Vec<_> = observations
+            .filter(|(_, previous)| self.supersedes_malformed_observation(previous))
+            .collect();
+        let earliest = superseded
+            .iter()
+            .filter(|(_, previous)| previous.ts_init < self.ts_init)
+            .min_by_key(|(_, previous)| previous.ts_init)
+            .map(|(index, _)| *index);
+        superseded
+            .into_iter()
+            .filter_map(|(index, _)| (Some(index) != earliest).then_some(index))
+            .collect()
+    }
+
+    /// Whether a complete trade agrees with every independently retained fact.
+    #[must_use]
+    pub fn matches_fill(&self, fill: &FillReport) -> bool {
+        !self.unrepresentable_values
+            && self.account_id == fill.account_id
+            && self.instrument_id == fill.instrument_id
+            && self.venue_order_id == fill.venue_order_id
+            && self.trade_id == Some(fill.trade_id)
+            && self
+                .client_order_id
+                .is_none_or(|id| fill.client_order_id.is_none_or(|other| id == other))
+            && self.order_side == fill.order_side
+            && self
+                .last_qty
+                .is_none_or(|qty| qty == fill.last_qty.as_decimal())
+            && self
+                .last_px
+                .is_none_or(|px| px == fill.last_px.as_decimal())
+            && self
+                .commission_amount
+                .is_none_or(|fee| fee == fill.commission.as_decimal())
+            && self
+                .commission_currency
+                .is_none_or(|currency| currency == fill.commission.currency)
+            && self
+                .liquidity_side
+                .is_none_or(|side| side == fill.liquidity_side)
+            && self.venue_position_id == fill.venue_position_id
+            && self.ts_event.is_none_or(|time| time == fill.ts_event)
+    }
+
+    /// Compares repeated successful observations, excluding local receipt metadata.
+    #[must_use]
+    pub fn same_successful_observation(&self, other: &Self) -> bool {
+        !self.requires_fresh_query && self.same_observed_facts(other)
+    }
+
+    /// Checks that retained successful status context agrees with its execution facts.
+    #[must_use]
+    pub fn snapshot_is_consistent(&self) -> bool {
+        self.order_snapshot
+            .as_ref()
+            .map_or(self.requires_fresh_query, |snapshot| {
+                snapshot.account_id == self.account_id
+                    && snapshot.instrument_id == self.instrument_id
+                    && snapshot.venue_order_id == self.venue_order_id
+                    && snapshot.client_order_id == self.client_order_id
+                    && snapshot.order_side == Some(self.order_side)
+                    && snapshot.venue_position_id == self.venue_position_id
+                    && (snapshot.ts_init == self.ts_init
+                        || (self.requires_fresh_query && snapshot.ts_init < self.ts_init))
+                    && self.ts_event.is_none_or(|time| time <= snapshot.ts_last)
+            })
+    }
+
+    /// Checks last-execution ordering inside the originating snapshot, without ordering ties.
+    #[must_use]
+    pub fn respects_snapshot_boundary(&self, last: UnixNanos, execution_time: UnixNanos) -> bool {
+        self.order_snapshot.as_ref().is_none_or(|snapshot| {
+            last <= snapshot.ts_last
+                && (execution_time <= last || execution_time > snapshot.ts_last)
+        })
+    }
+
+    /// Checks fresh query identity and observed facts, without asserting accounting.
+    /// Callers must additionally prove complete history and committed native execution.
+    #[must_use]
+    pub fn matches_query(&self, report: &OrderStatusReport, fills: &[FillReport]) -> bool {
+        self.snapshot_is_consistent()
+            && self.account_id == report.account_id
+            && self.instrument_id == report.instrument_id
+            && self.venue_order_id == report.venue_order_id
+            && self
+                .client_order_id
+                .is_none_or(|id| report.client_order_id.is_none_or(|other| id == other))
+            && (report.ts_init > self.ts_init
+                || (!self.requires_fresh_query && report.ts_init == self.ts_init))
+            && fills.iter().any(|last| {
+                self.matches_fill(last)
+                    && fills
+                        .iter()
+                        .all(|fill| self.respects_snapshot_boundary(last.ts_event, fill.ts_event))
+            })
+    }
+}
+
 /// Execution report variants for reconciliation.
 #[derive(Clone, Debug)]
 pub enum ExecutionReport {
     Order(Box<OrderStatusReport>),
     Fill(Box<FillReport>),
+    /// An observed authoritative trade which constrains recovery without applying accounting.
+    /// Retain it until matching native execution history proves the exact economic fact.
+    FillEvidence(Box<FillReport>),
+    /// An observed trade whose cumulative order evidence is unavailable or inexact.
+    /// A fresh complete order query is required even when this trade is already committed.
+    FillQueryRequired(Box<FillReport>),
+    /// Partial execution facts retained without inferred economic values.
+    IncompleteFill(Box<IncompleteFillReport>),
+    /// Immutable cumulative commission constraints, without accounting authority.
+    OrderFeeEvidence(Box<OrderFeeEvidence>),
     OrderWithFills(Box<OrderStatusReport>, Vec<FillReport>),
+    /// Order query with authoritative fills, without snapshot correction authority.
+    ///
+    /// An empty fill list with positive `filled_qty` signals incomplete execution
+    /// evidence. Consumers must retain it unresolved until real fills account for it.
+    OrderQueryWithFills(Box<OrderStatusReport>, Vec<FillReport>),
+    /// Stream execution evidence, without complete order-scoped query authority.
+    ///
+    /// Companion trades constrain recovery without applying fills. Status-only
+    /// projection requires committed native executions to account for the snapshot.
+    OrderFillEvidence(Box<OrderStatusReport>, Vec<FillReport>),
+    /// Contradictory execution evidence which quantity agreement cannot resolve.
+    OrderFillConflict(Box<OrderStatusReport>),
     Position(Box<PositionStatusReport>),
     MassStatus(Box<ExecutionMassStatus>),
 }
@@ -62,8 +278,22 @@ impl Display for ExecutionReport {
         match self {
             Self::Order(report) => write!(f, "{report}"),
             Self::Fill(report) => write!(f, "{report}"),
-            Self::OrderWithFills(report, fills) => {
-                write!(f, "OrderWithFills(order={report}, fills=[")?;
+            Self::FillEvidence(report) => write!(f, "FillEvidence({report})"),
+            Self::FillQueryRequired(report) => write!(f, "FillQueryRequired({report})"),
+            Self::IncompleteFill(report) => write!(f, "IncompleteFill({report:?})"),
+            Self::OrderFeeEvidence(report) => write!(f, "OrderFeeEvidence({report:?})"),
+            Self::OrderFillConflict(report) => write!(f, "OrderFillConflict({report})"),
+            Self::OrderWithFills(report, fills)
+            | Self::OrderQueryWithFills(report, fills)
+            | Self::OrderFillEvidence(report, fills) => {
+                let kind = if matches!(self, Self::OrderQueryWithFills(_, _)) {
+                    "OrderQueryWithFills"
+                } else if matches!(self, Self::OrderFillEvidence(_, _)) {
+                    "OrderFillEvidence"
+                } else {
+                    "OrderWithFills"
+                };
+                write!(f, "{kind}(order={report}, fills=[")?;
                 for (index, fill) in fills.iter().enumerate() {
                     if index > 0 {
                         f.write_str(", ")?;
@@ -467,6 +697,147 @@ mod tests {
 
             assert_eq!(command.to_string(), expected);
         }
+    }
+
+    #[rstest]
+    #[case("complete", true)]
+    #[case("missing_trade", false)]
+    #[case("wrong_trade", false)]
+    #[case("quantity", false)]
+    #[case("price", false)]
+    #[case("commission", false)]
+    #[case("commission_currency", false)]
+    #[case("unrepresentable", false)]
+    #[case("money_precision", false)]
+    #[case("known_amount", true)]
+    #[case("known_currency", true)]
+    #[case("old_query", false)]
+    #[case("same_time_query", false)]
+    #[case("successful_same_query", true)]
+    #[case("successful_old_query", false)]
+    #[case("snapshot_account", false)]
+    #[case("snapshot_instrument", false)]
+    #[case("snapshot_order", false)]
+    #[case("snapshot_client", false)]
+    #[case("snapshot_side", false)]
+    #[case("snapshot_position", false)]
+    #[case("snapshot_time", false)]
+    #[case("snapshot_boundary", false)]
+    #[case("snapshot_missing", false)]
+    fn incomplete_fill_requires_identity_exact_facts_and_fresh_query(
+        #[case] change: &str,
+        #[case] expected: bool,
+    ) {
+        let fill = fill_report("T-001");
+        let mut report = order_status_report();
+        report.ts_init = UnixNanos::from(6);
+        report.ts_last = fill.ts_event;
+        let mut evidence = IncompleteFillReport {
+            account_id: fill.account_id,
+            instrument_id: fill.instrument_id,
+            venue_order_id: fill.venue_order_id,
+            client_order_id: fill.client_order_id,
+            trade_id: Some(fill.trade_id),
+            order_side: fill.order_side,
+            last_qty: Some(fill.last_qty.as_decimal()),
+            last_px: Some(fill.last_px.as_decimal()),
+            commission_amount: None,
+            commission_currency: None,
+            unrepresentable_values: false,
+            requires_fresh_query: true,
+            order_snapshot: None,
+            liquidity_side: Some(fill.liquidity_side),
+            venue_position_id: fill.venue_position_id,
+            ts_event: Some(fill.ts_event),
+            ts_init: fill.ts_init,
+        };
+
+        match change {
+            "missing_trade" => evidence.trade_id = None,
+            "wrong_trade" => evidence.trade_id = Some(TradeId::from("OTHER")),
+            "quantity" => evidence.last_qty = Some(Decimal::from(2)),
+            "price" => evidence.last_px = Some(Decimal::from(2)),
+            "commission" => {
+                evidence.commission_amount = Some(Decimal::from_str_exact("0.02").unwrap());
+            }
+            "commission_currency" => evidence.commission_currency = Some(Currency::BTC()),
+            "unrepresentable" => evidence.unrepresentable_values = true,
+            "money_precision" => {
+                evidence.commission_amount =
+                    Some(Decimal::from_str_exact("0.01000000000000001").unwrap());
+            }
+            "known_amount" => evidence.commission_amount = Some(fill.commission.as_decimal()),
+            "known_currency" => evidence.commission_currency = Some(fill.commission.currency),
+            "old_query" => report.ts_init = UnixNanos::from(4),
+            "same_time_query" => report.ts_init = evidence.ts_init,
+            "successful_same_query" => {
+                evidence.requires_fresh_query = false;
+                report.ts_init = evidence.ts_init;
+            }
+            "successful_old_query" => {
+                evidence.requires_fresh_query = false;
+                report.ts_init = UnixNanos::from(4);
+            }
+            value if value.starts_with("snapshot_") => evidence.requires_fresh_query = false,
+            "complete" => {}
+            _ => unreachable!(),
+        }
+
+        if !evidence.requires_fresh_query {
+            let mut snapshot = report.clone();
+            snapshot.ts_init = evidence.ts_init;
+            snapshot.client_order_id = evidence.client_order_id;
+            match change {
+                "snapshot_account" => snapshot.account_id = AccountId::from("OTHER-001"),
+                "snapshot_instrument" => snapshot.instrument_id = InstrumentId::from("BTC/USD.SIM"),
+                "snapshot_order" => snapshot.venue_order_id = VenueOrderId::from("OTHER"),
+                "snapshot_client" => snapshot.client_order_id = Some(ClientOrderId::from("OTHER")),
+                "snapshot_side" => snapshot.order_side = Some(OrderSide::Sell),
+                "snapshot_position" => snapshot.venue_position_id = Some(PositionId::from("OTHER")),
+                "snapshot_time" => snapshot.ts_init = UnixNanos::from(99),
+                "snapshot_boundary" => snapshot.ts_last = UnixNanos::from(1),
+                _ => {}
+            }
+
+            if change != "snapshot_missing" {
+                evidence.order_snapshot = Some(Box::new(snapshot));
+            }
+        }
+
+        if evidence.snapshot_is_consistent() && !evidence.requires_fresh_query {
+            let mut repeated = evidence.clone();
+            repeated.ts_init = UnixNanos::from(99);
+            let snapshot = repeated.order_snapshot.as_mut().unwrap();
+            snapshot.ts_init = repeated.ts_init;
+            snapshot.report_id = UUID4::new();
+            assert!(evidence.same_successful_observation(&repeated));
+            repeated.trade_id = Some(TradeId::from("OTHER"));
+            assert!(!evidence.same_successful_observation(&repeated));
+        }
+        let mut later = evidence.clone();
+        later.ts_init = UnixNanos::from(100);
+        assert_eq!(
+            later.supersedes_malformed_observation(&evidence),
+            evidence.requires_fresh_query && evidence.snapshot_is_consistent(),
+        );
+        assert!(!evidence.supersedes_malformed_observation(&later));
+        later.commission_currency = Some(Currency::EUR());
+        assert!(!later.supersedes_malformed_observation(&evidence));
+        let encoded = rmp_serde::to_vec_named(&evidence).unwrap();
+        let restored: IncompleteFillReport = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(restored, evidence);
+        for field in [
+            "unrepresentable_values",
+            "requires_fresh_query",
+            "order_snapshot",
+        ] {
+            let mut old = serde_json::to_value(&evidence).unwrap();
+            old.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<IncompleteFillReport>(old.clone()).is_err());
+            let old = rmp_serde::to_vec_named(&old).unwrap();
+            assert!(rmp_serde::from_slice::<IncompleteFillReport>(&old).is_err());
+        }
+        assert_eq!(restored.matches_query(&report, &[fill]), expected);
     }
 
     #[rstest]

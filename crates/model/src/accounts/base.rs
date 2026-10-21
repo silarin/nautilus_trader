@@ -200,8 +200,6 @@ impl BaseAccount {
     ///
     /// Returns an error if the accumulated commission exceeds [`Money`] bounds.
     pub fn try_update_commissions(&mut self, commission: Money) -> anyhow::Result<()> {
-        // TODO: Remove once from_raw enforces canonical precision alignment (v2)
-        let commission = commission.normalized();
         if commission.is_zero() {
             return Ok(());
         }
@@ -821,7 +819,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_commissions_sub_canonical_raw_skipped() {
+    fn test_update_commissions_preserves_fractional_currency_units() {
         use crate::{
             events::account::stubs::cash_account_state,
             types::{Currency, Money},
@@ -830,10 +828,12 @@ mod tests {
         let mut account = BaseAccount::new(cash_account_state(), true);
         let usd = Currency::USD();
 
-        // Sub-canonical raw (1 < tick size for USD precision 2) normalizes to zero
+        // Exact native fee units must not be rounded to the currency display precision.
         account.update_commissions(Money::from_raw(1, usd));
 
-        assert!(account.commission(&usd).is_none());
+        assert_eq!(account.commission(&usd), Some(Money::from_raw(1, usd)));
+        account.update_commissions(Money::from_raw(-2, usd));
+        assert_eq!(account.commission(&usd), Some(Money::from_raw(-1, usd)));
     }
 
     #[rstest]

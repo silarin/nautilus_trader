@@ -24,7 +24,13 @@ use std::{collections::VecDeque, fmt::Debug, hash::Hash, sync::Arc};
 
 use ahash::AHashMap;
 use dashmap::DashMap;
-use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
+use nautilus_common::{
+    cache::fifo::{FifoCache, FifoCacheMap},
+    messages::{
+        ExecutionReport as NativeExecutionReport,
+        execution::{IncompleteFillReport, OrderFeeOrigin},
+    },
+};
 use nautilus_core::{AtomicMap, UUID4, UnixNanos, time::AtomicTime};
 use nautilus_live::{
     ExecutionEventEmitter,
@@ -44,10 +50,11 @@ use nautilus_model::{
     },
     instruments::{Instrument, InstrumentAny},
     orders::TRIGGERABLE_ORDER_TYPES,
-    reports::FillReport,
+    reports::{FillReport, OrderStatusReport},
     types::Currency,
 };
 use parking_lot::Mutex;
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
 use crate::{
@@ -59,8 +66,9 @@ use crate::{
         enums::{OKXAlgoOrderStatus, OKXAlgoOrderType, OKXOrderStatus, OKXOrderType},
         failure::{classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
-            is_market_price, parse_client_order_id, parse_millisecond_timestamp, parse_price,
-            parse_quantity,
+            CumulativeFeeFields, is_market_price, parse_client_order_id, parse_incomplete_decimal,
+            parse_millisecond_timestamp, parse_order_fee_evidence, parse_price, parse_quantity,
+            venue_position_id,
         },
     },
     http::models::{OKXAccount, OKXCancelAlgoOrderResponse, OKXPosition, OKXSpreadOrder},
@@ -187,6 +195,8 @@ pub struct WsDispatchState {
     filled_orders: DedupCache<ClientOrderId>,
     terminal_orders: DedupCache<ClientOrderId>,
     emitted_trades: DedupCache<TradeId>,
+    regular_fill_evidence:
+        Mutex<FifoCacheMap<(VenueOrderId, TradeId), (OKXOrderMsg, FillReport), DEDUP_CAPACITY>>,
     post_only_rejections: DedupCache<Ustr>,
     lifecycle_bindings: Mutex<OrderLifecycleBindings>,
     pending_linked_children: Mutex<VecDeque<PendingLinkedChild>>,
@@ -213,6 +223,7 @@ impl Default for WsDispatchState {
             filled_orders: DedupCache::new(),
             terminal_orders: DedupCache::new(),
             emitted_trades: DedupCache::new(),
+            regular_fill_evidence: Mutex::new(FifoCacheMap::new()),
             post_only_rejections: DedupCache::new(),
             lifecycle_bindings: Mutex::new(OrderLifecycleBindings::default()),
             pending_linked_children: Mutex::new(VecDeque::new()),
@@ -913,6 +924,14 @@ fn dispatch_algo_order_message(
     match route {
         ExecutionUpdateRoute::External => {
             match parse_algo_order_msg(msg, account_id, instruments, ts_init) {
+                Ok(Some(ExecutionReport::Order(report))) if report.filled_qty.is_positive() => {
+                    // Algo status identifies the child but supplies no execution or fee.
+                    // Preserve recovery without declaring its economic state terminal.
+                    emitter.send_execution_report(NativeExecutionReport::OrderQueryWithFills(
+                        Box::new(report),
+                        Vec::new(),
+                    ));
+                }
                 Ok(Some(report)) => dispatch_execution_reports(vec![report], emitter, state),
                 Ok(None) => {}
                 Err(e) => log::error!("Failed to parse external algo order message: {e}"),
@@ -1404,8 +1423,46 @@ fn emit_order_update(
     emitter.send_order_event(OrderEventAny::Updated(updated));
 }
 
-/// Dispatches order messages, producing proper order events for tracked orders
-/// and falling back to execution reports for untracked/external orders.
+/// Emits immutable cumulative facts before every regular-order execution ingress.
+fn dispatch_order_fee_evidence(
+    msg: &OKXOrderMsg,
+    client_order_id: Option<ClientOrderId>,
+    instrument: &InstrumentAny,
+    emitter: &ExecutionEventEmitter,
+    ts_init: UnixNanos,
+) {
+    if let Some(fee) = parse_order_fee_evidence(
+        &CumulativeFeeFields {
+            instrument_type: msg.inst_type,
+            side: msg.side,
+            position_side: msg.pos_side,
+            venue_order_id: msg.ord_id.as_str(),
+            client_order_id: client_order_id
+                .or_else(|| {
+                    msg.algo_cl_ord_id
+                        .as_deref()
+                        .and_then(parse_client_order_id)
+                })
+                .or_else(|| parse_client_order_id(&msg.cl_ord_id)),
+            quantity: msg.acc_fill_sz.as_deref().unwrap_or_default(),
+            fee: msg.fee.as_deref(),
+            fee_currency: msg.fee_ccy.as_str(),
+            rebate: msg.rebate.as_deref(),
+            rebate_currency: msg.rebate_ccy.as_ref().map(Ustr::as_str),
+            trade_id: &msg.trade_id,
+            fill_time: msg.fill_time,
+            update_time: msg.u_time,
+        },
+        emitter.account_id(),
+        instrument.id(),
+        OrderFeeOrigin::Stream,
+        ts_init,
+    ) {
+        emitter.send_execution_report(NativeExecutionReport::OrderFeeEvidence(Box::new(fee)));
+    }
+}
+
+/// Dispatches order messages for tracked and external native orders.
 #[expect(clippy::too_many_arguments)]
 fn dispatch_order_messages(
     order_msgs: &[OKXOrderMsg],
@@ -1504,6 +1561,7 @@ fn dispatch_order_messages(
         };
 
         if let Some(ident) = identity {
+            dispatch_order_fee_evidence(msg, Some(client_order_id), instrument, emitter, ts_init);
             let context = state
                 .order_contexts
                 .get(&client_order_id)
@@ -1618,6 +1676,18 @@ fn dispatch_order_messages(
                 continue;
             }
 
+            if dispatch_duplicate_regular_fill(
+                msg,
+                Some(client_order_id),
+                instrument,
+                emitter,
+                state,
+                ts_init,
+            ) {
+                continue;
+            }
+            let duplicate =
+                !msg.trade_id.is_empty() && state.contains_trade(&TradeId::new(&msg.trade_id));
             let previous_fee = fee_cache.get(&msg.ord_id).copied();
             let previous_filled_qty = filled_qty_cache.get(&msg.ord_id).copied();
             let previous_state = order_state_cache.get(&client_order_id);
@@ -1635,8 +1705,44 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
-                    let needs_status =
-                        matches!(event, ParsedOrderEvent::Fill(_) | ParsedOrderEvent::Skipped);
+                    // Regular status-only execution evidence must not infer trades.
+                    let event = match event {
+                        ParsedOrderEvent::StatusOnly(report) if report.filled_qty.is_positive() => {
+                            ParsedOrderEvent::Skipped
+                        }
+                        event => event,
+                    };
+                    let fill_evidence = match &event {
+                        ParsedOrderEvent::Fill(fill) => Some(fill.clone()),
+                        _ => None,
+                    };
+                    let needs_status = msg.trade_id.is_empty()
+                        || !state.contains_trade(&TradeId::new(&msg.trade_id))
+                        || matches!(
+                            event,
+                            ParsedOrderEvent::Skipped
+                                | ParsedOrderEvent::Canceled(_)
+                                | ParsedOrderEvent::Expired(_)
+                        );
+                    let obligation = dispatch_order_fill_obligation(
+                        msg,
+                        Some(client_order_id),
+                        instrument,
+                        emitter,
+                        ts_init,
+                        needs_status,
+                        fill_evidence.as_ref(),
+                    );
+
+                    if obligation.is_none()
+                        && needs_status
+                        && let Some(fill) = fill_evidence
+                    {
+                        emitter.send_execution_report(NativeExecutionReport::FillQueryRequired(
+                            Box::new(fill),
+                        ));
+                        continue;
+                    }
                     update_order_state_cache(msg, instrument, client_order_id, order_state_cache);
                     dispatch_parsed_order_event(
                         event,
@@ -1652,15 +1758,9 @@ fn dispatch_order_messages(
                         ts_init,
                     );
 
-                    dispatch_filled_order_status(
-                        msg,
-                        Some(client_order_id),
-                        instrument,
-                        emitter,
-                        state,
-                        ts_init,
-                        needs_status,
-                    );
+                    if let Some(ref report) = obligation {
+                        record_order_fill_state(report, state);
+                    }
 
                     if state.contains_terminal(&client_order_id)
                         && let Some(bindings) = lifecycle_bindings.as_mut()
@@ -1670,9 +1770,25 @@ fn dispatch_order_messages(
                         bindings.finish(client_order_id, binding);
                     }
 
-                    update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
+                    if let (Some(report), Some(fill)) = (obligation.as_ref(), fill_evidence) {
+                        retain_regular_fill_evidence(msg, report, fill, emitter, state);
+                    }
+
+                    if !duplicate {
+                        update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
+                    }
                 }
-                Err(e) => log::error!("Failed to parse order event for {client_order_id}: {e}"),
+                Err(e) => {
+                    log::error!("Failed to parse order event for {client_order_id}: {e}");
+                    dispatch_unparsed_order_fill(
+                        msg,
+                        Some(client_order_id),
+                        instrument,
+                        emitter,
+                        state,
+                        ts_init,
+                    );
+                }
             }
         } else if state.contains_terminal(&client_order_id) {
             dispatch_terminal_order_fill_as_report(
@@ -2154,6 +2270,16 @@ fn dispatch_order_msg_as_report(
     state: &WsDispatchState,
     ts_init: UnixNanos,
 ) {
+    if let Some(instrument) = instruments.get(&msg.inst_id) {
+        dispatch_order_fee_evidence(msg, None, instrument, emitter, ts_init);
+    }
+
+    if let Some(instrument) = instruments.get(&msg.inst_id)
+        && dispatch_duplicate_regular_fill(msg, None, instrument, emitter, state, ts_init)
+    {
+        return;
+    }
+    let duplicate = !msg.trade_id.is_empty() && state.contains_trade(&TradeId::new(&msg.trade_id));
     match parse_order_msg(
         msg,
         account_id,
@@ -2163,58 +2289,271 @@ fn dispatch_order_msg_as_report(
         ts_init,
     ) {
         Ok(report) => {
-            let needs_status = matches!(report, ExecutionReport::Fill(_));
-            dispatch_execution_reports(vec![report], emitter, state);
-
-            if let Some(instrument) = instruments.get(&msg.inst_id) {
-                dispatch_filled_order_status(
+            let fill_evidence = match &report {
+                ExecutionReport::Fill(fill) => Some(fill.clone()),
+                _ => None,
+            };
+            let status_obligation = matches!(&report, ExecutionReport::Order(report) if report.filled_qty.is_positive());
+            let needs_status = status_obligation
+                || msg.trade_id.is_empty()
+                || !state.contains_trade(&TradeId::new(&msg.trade_id));
+            let obligation = instruments.get(&msg.inst_id).and_then(|instrument| {
+                dispatch_order_fill_obligation(
                     msg,
                     None,
                     instrument,
                     emitter,
-                    state,
                     ts_init,
                     needs_status,
-                );
+                    fill_evidence.as_ref(),
+                )
+            });
+
+            if obligation.is_none()
+                && needs_status
+                && let Some(fill) = fill_evidence
+            {
+                emitter.send_execution_report(NativeExecutionReport::FillQueryRequired(Box::new(
+                    fill,
+                )));
+                return;
+            }
+
+            if !status_obligation {
+                dispatch_execution_reports(vec![report], emitter, state);
+            }
+
+            if let Some(ref report) = obligation {
+                record_order_fill_state(report, state);
+            }
+
+            if let (Some(report), Some(fill)) = (obligation.as_ref(), fill_evidence) {
+                retain_regular_fill_evidence(msg, report, fill, emitter, state);
+            }
+
+            if !duplicate && let Some(instrument) = instruments.get(&msg.inst_id) {
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
         }
-        Err(e) => log::error!("Failed to parse order message as report: {e}"),
+        Err(e) => {
+            log::error!("Failed to parse order message as report: {e}");
+
+            if let Some(instrument) = instruments.get(&msg.inst_id) {
+                dispatch_unparsed_order_fill(msg, None, instrument, emitter, state, ts_init);
+            }
+        }
     }
 }
 
-fn dispatch_filled_order_status(
+// Preserve the original economic fields for retransmissions whose cumulative fee
+// cannot be parsed again after the stream baseline has advanced. This bounded
+// transport cache never supplies or changes native accounting.
+fn same_regular_fill_evidence(a: &OKXOrderMsg, b: &OKXOrderMsg) -> bool {
+    fn decimal_equal(a: &str, b: &str) -> bool {
+        a == b
+            || matches!((Decimal::from_str_exact(a), Decimal::from_str_exact(b)),
+            (Ok(a), Ok(b)) if a == b)
+    }
+    a.inst_id == b.inst_id
+        && a.ord_id == b.ord_id
+        && a.side == b.side
+        && a.pos_side == b.pos_side
+        && a.exec_type == b.exec_type
+        && a.fill_time == b.fill_time
+        && a.fee_ccy == b.fee_ccy
+        && a.fill_fee_ccy == b.fill_fee_ccy
+        && a.rebate_ccy == b.rebate_ccy
+        && decimal_equal(
+            a.rebate.as_deref().unwrap_or_default(),
+            b.rebate.as_deref().unwrap_or_default(),
+        )
+        && decimal_equal(&a.fill_sz, &b.fill_sz)
+        && decimal_equal(&a.fill_px, &b.fill_px)
+        && decimal_equal(
+            a.acc_fill_sz.as_deref().unwrap_or_default(),
+            b.acc_fill_sz.as_deref().unwrap_or_default(),
+        )
+        && decimal_equal(
+            a.fee.as_deref().unwrap_or_default(),
+            b.fee.as_deref().unwrap_or_default(),
+        )
+        && decimal_equal(
+            a.fill_fee.as_deref().unwrap_or_default(),
+            b.fill_fee.as_deref().unwrap_or_default(),
+        )
+}
+
+fn retain_regular_fill_evidence(
+    msg: &OKXOrderMsg,
+    report: &OrderStatusReport,
+    fill: FillReport,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+) {
+    state.regular_fill_evidence.lock().insert(
+        (fill.venue_order_id, fill.trade_id),
+        (msg.clone(), fill.clone()),
+    );
+    // Captured companion evidence must agree with the committed native fill even
+    // after transport deduplication state is evicted or a connection restarts.
+    emitter.send_execution_report(NativeExecutionReport::OrderFillEvidence(
+        Box::new(report.clone()),
+        vec![fill],
+    ));
+}
+
+fn dispatch_duplicate_regular_fill(
     msg: &OKXOrderMsg,
     client_order_id: Option<ClientOrderId>,
     instrument: &InstrumentAny,
     emitter: &ExecutionEventEmitter,
     state: &WsDispatchState,
     ts_init: UnixNanos,
-    needs_status: bool,
+) -> bool {
+    if msg.trade_id.is_empty()
+        || Decimal::from_str_exact(&msg.fill_sz).is_ok_and(|qty| qty.is_zero())
+    {
+        return false;
+    }
+    let key = (VenueOrderId::new(msg.ord_id), TradeId::new(&msg.trade_id));
+    let Some((previous, fill)) = state.regular_fill_evidence.lock().get(&key).cloned() else {
+        return false;
+    };
+    let mut report = match parse_order_status_report(msg, instrument, emitter.account_id(), ts_init)
+    {
+        Ok(report) => report,
+        Err(_) => parse_order_status_report(&previous, instrument, emitter.account_id(), ts_init)
+            .expect("Previously accepted regular fill has a valid status"),
+    };
+    report.client_order_id = client_order_id.or(report.client_order_id);
+
+    if same_regular_fill_evidence(&previous, msg) {
+        emitter.send_execution_report(NativeExecutionReport::OrderFillEvidence(
+            Box::new(report.clone()),
+            vec![fill],
+        ));
+        record_order_fill_state(&report, state);
+    } else {
+        emitter.send_execution_report(NativeExecutionReport::OrderFillConflict(Box::new(report)));
+    }
+    true
+}
+
+// Retain cumulative progress and every independently parsed execution fact when
+// its fee or fill is unusable. Complete native history must account for both;
+// never synthesize a fill or seed stream caches from partial evidence.
+fn dispatch_unparsed_order_fill(
+    msg: &OKXOrderMsg,
+    client_order_id: Option<ClientOrderId>,
+    instrument: &InstrumentAny,
+    emitter: &ExecutionEventEmitter,
+    state: &WsDispatchState,
+    ts_init: UnixNanos,
 ) {
-    if !needs_status || msg.state != OKXOrderStatus::Filled {
+    // Match the native dispatch deduplication rule before parsing cumulative fees:
+    // a replayed execution must not create a fresh obligation after caches advance.
+    if !msg.trade_id.is_empty() && state.contains_trade(&TradeId::new(&msg.trade_id)) {
         return;
     }
 
-    let report = parse_order_status_report(msg, instrument, emitter.account_id(), ts_init)
-        .and_then(|report| {
-            let requested = parse_quantity(&msg.sz, instrument.size_precision())?;
-            Ok((report, requested))
-        });
-
-    match report {
-        Ok((mut report, requested)) => {
-            if report.filled_qty.is_positive() && report.quantity != requested {
-                report.client_order_id = client_order_id.or(report.client_order_id);
-
-                // The caller dispatches any real fill first; reconcile base shortfalls and quote sizing
-                dispatch_execution_reports(vec![ExecutionReport::Order(report)], emitter, state);
-            }
+    match parse_order_status_report(msg, instrument, emitter.account_id(), ts_init) {
+        Ok(mut report) if report.filled_qty.is_positive() => {
+            report.client_order_id = client_order_id.or(report.client_order_id);
+            emitter.send_execution_report(NativeExecutionReport::OrderFillEvidence(
+                Box::new(report),
+                Vec::new(),
+            ));
         }
-        Err(e) => log::error!(
-            "Failed to parse filled order status for {}: {e}",
-            msg.ord_id
-        ),
+        Ok(_) => {}
+        Err(e) => {
+            log::error!(
+                "Cannot parse order fill recovery evidence for {}: {e}",
+                msg.ord_id
+            );
+        }
+    }
+    let mut unrepresentable_values = false;
+    let last_qty = parse_incomplete_decimal(&msg.fill_sz, &mut unrepresentable_values);
+    let last_px = parse_incomplete_decimal(&msg.fill_px, &mut unrepresentable_values);
+    let commission_amount = msg.fill_fee.as_deref().and_then(|fee| {
+        parse_incomplete_decimal(fee, &mut unrepresentable_values).map(|amount| -amount)
+    });
+    let commission_currency = msg
+        .fill_fee_ccy
+        .filter(|ccy| !ccy.as_str().trim().is_empty())
+        .map(|ccy| Currency::get_or_create_crypto(ccy.as_str().trim()));
+    let report = IncompleteFillReport {
+        account_id: emitter.account_id(),
+        instrument_id: instrument.id(),
+        venue_order_id: VenueOrderId::new(msg.ord_id),
+        client_order_id: client_order_id.or_else(|| parse_client_order_id(msg.cl_ord_id.as_str())),
+        trade_id: (!msg.trade_id.is_empty()).then(|| TradeId::new(&msg.trade_id)),
+        order_side: msg.side.into(),
+        last_qty,
+        last_px,
+        commission_amount,
+        commission_currency,
+        unrepresentable_values,
+        requires_fresh_query: true,
+        order_snapshot: None,
+        liquidity_side: Some(msg.exec_type.into()),
+        venue_position_id: venue_position_id(instrument.id(), msg.pos_side),
+        ts_event: (msg.fill_time > 0).then(|| parse_millisecond_timestamp(msg.fill_time)),
+        ts_init,
+    };
+    emitter.send_execution_report(NativeExecutionReport::IncompleteFill(Box::new(report)));
+}
+
+fn dispatch_order_fill_obligation(
+    msg: &OKXOrderMsg,
+    client_order_id: Option<ClientOrderId>,
+    instrument: &InstrumentAny,
+    emitter: &ExecutionEventEmitter,
+    ts_init: UnixNanos,
+    needs_status: bool,
+    fill: Option<&FillReport>,
+) -> Option<OrderStatusReport> {
+    if !needs_status {
+        return None;
+    }
+
+    match parse_order_status_report(msg, instrument, emitter.account_id(), ts_init) {
+        Ok(mut report) if report.filled_qty.is_positive() => {
+            report.client_order_id = client_order_id.or(report.client_order_id);
+            // Publish cumulative evidence first so the native manager can check the
+            // committed cache before admitting the accompanying individual execution.
+            emitter.send_execution_report(NativeExecutionReport::OrderFillEvidence(
+                Box::new(report.clone()),
+                fill.into_iter().cloned().collect(),
+            ));
+            Some(report)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            log::error!(
+                "Cannot parse cumulative fill obligation for {}: {e}",
+                msg.ord_id
+            );
+            None
+        }
+    }
+}
+
+fn record_order_fill_state(report: &OrderStatusReport, state: &WsDispatchState) {
+    if let Some(cid) = report.client_order_id {
+        match report.order_status {
+            OrderStatus::Filled => {
+                state.insert_filled(cid);
+                state.insert_terminal(cid);
+                state.remove_triggered(&cid);
+            }
+            OrderStatus::Canceled | OrderStatus::Expired => {
+                state.insert_terminal(cid);
+                state.remove_triggered(&cid);
+                state.remove_filled(&cid);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2230,6 +2569,23 @@ fn dispatch_terminal_order_fill_as_report(
     state: &WsDispatchState,
     ts_init: UnixNanos,
 ) {
+    if let Some(instrument) = instruments.get(&msg.inst_id) {
+        dispatch_order_fee_evidence(msg, Some(client_order_id), instrument, emitter, ts_init);
+    }
+
+    if let Some(instrument) = instruments.get(&msg.inst_id)
+        && dispatch_duplicate_regular_fill(
+            msg,
+            Some(client_order_id),
+            instrument,
+            emitter,
+            state,
+            ts_init,
+        )
+    {
+        return;
+    }
+    let duplicate = !msg.trade_id.is_empty() && state.contains_trade(&TradeId::new(&msg.trade_id));
     match parse_order_msg(
         msg,
         account_id,
@@ -2240,19 +2596,74 @@ fn dispatch_terminal_order_fill_as_report(
     ) {
         Ok(ExecutionReport::Fill(mut report)) => {
             report.client_order_id = Some(client_order_id);
-            dispatch_execution_reports(vec![ExecutionReport::Fill(report)], emitter, state);
+            let needs_status = !state.contains_trade(&report.trade_id);
 
-            if let Some(instrument) = instruments.get(&msg.inst_id) {
+            let obligation = instruments.get(&msg.inst_id).and_then(|instrument| {
+                dispatch_order_fill_obligation(
+                    msg,
+                    Some(client_order_id),
+                    instrument,
+                    emitter,
+                    ts_init,
+                    needs_status,
+                    Some(&report),
+                )
+            });
+
+            if obligation.is_none() && needs_status {
+                emitter.send_execution_report(NativeExecutionReport::FillQueryRequired(Box::new(
+                    report,
+                )));
+                return;
+            }
+            let fill_evidence = report.clone();
+            dispatch_execution_reports(vec![ExecutionReport::Fill(report)], emitter, state);
+            if let Some(ref report) = obligation {
+                record_order_fill_state(report, state);
+            }
+
+            if let Some(report) = obligation.as_ref() {
+                retain_regular_fill_evidence(msg, report, fill_evidence, emitter, state);
+            }
+
+            if !duplicate && let Some(instrument) = instruments.get(&msg.inst_id) {
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
         }
-        Ok(ExecutionReport::Order(_)) => {
+        Ok(ExecutionReport::Order(report)) => {
+            if report.filled_qty.is_positive()
+                && !duplicate
+                && let Some(instrument) = instruments.get(&msg.inst_id)
+            {
+                dispatch_order_fill_obligation(
+                    msg,
+                    Some(client_order_id),
+                    instrument,
+                    emitter,
+                    ts_init,
+                    true,
+                    None,
+                );
+            }
             log::debug!(
                 "Suppressing stale regular order status for terminal tracked order {client_order_id}: ord_id={}",
                 msg.ord_id,
             );
         }
-        Err(e) => log::error!("Failed to parse terminal order update: {e}"),
+        Err(e) => {
+            log::error!("Failed to parse terminal order update: {e}");
+
+            if let Some(instrument) = instruments.get(&msg.inst_id) {
+                dispatch_unparsed_order_fill(
+                    msg,
+                    Some(client_order_id),
+                    instrument,
+                    emitter,
+                    state,
+                    ts_init,
+                );
+            }
+        }
     }
 }
 
@@ -2576,7 +2987,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        common::enums::{OKXInstrumentType, OKXSide, OKXTargetCurrency},
+        common::enums::{OKXExecType, OKXInstrumentType, OKXSide, OKXTargetCurrency},
         websocket::{error::OKXWsError, messages::OKXWsFrame},
     };
 
@@ -2689,10 +3100,252 @@ mod tests {
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     ) -> Vec<ExecutionEvent> {
         let mut events = Vec::new();
+
         while let Ok(event) = receiver.try_recv() {
+            // These assertions concern lifecycle delivery. Cumulative constraints
+            // are separately asserted before dispatch in the recovery test below
+            // and exercised through native LiveNode admission and replay fixtures.
+            if let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(report)) = &event
+            {
+                assert!(!report.constraints.is_empty());
+                continue;
+            }
             events.push(event);
         }
         events
+    }
+
+    fn assert_duplicate_fill_evidence(events: &[ExecutionEvent]) {
+        assert_eq!(events.len(), 1);
+        let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+            &events[0]
+        else {
+            panic!("Expected retained duplicate evidence");
+        };
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].venue_order_id, report.venue_order_id);
+    }
+
+    fn assert_appended_fill_evidence(events: &[ExecutionEvent]) {
+        let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+            events.last().unwrap()
+        else {
+            panic!("Expected companion evidence after native execution");
+        };
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].venue_order_id, report.venue_order_id);
+        assert_eq!(fills[0].instrument_id, report.instrument_id);
+        assert_eq!(fills[0].account_id, report.account_id);
+
+        match &events[events.len() - 2] {
+            ExecutionEvent::Order(OrderEventAny::Filled(fill)) => {
+                assert_eq!(fills[0].trade_id, fill.trade_id);
+                assert_eq!(fills[0].last_qty, fill.last_qty);
+                assert_eq!(fills[0].last_px, fill.last_px);
+                assert_eq!(Some(fills[0].commission), fill.commission);
+            }
+            ExecutionEvent::Report(CommonExecutionReport::Fill(fill)) => {
+                assert_eq!(&fills[0], fill.as_ref());
+            }
+            other => panic!("Expected native execution before evidence: {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case::tracked(true, false)]
+    #[case::untracked(false, false)]
+    #[case::terminal(false, true)]
+    fn incomplete_stream_fee_dispatches_native_recovery(
+        #[case] tracked: bool,
+        #[case] terminal: bool,
+    ) {
+        let mut msg = load_regular_order_messages("ws_orders.json").remove(0);
+        msg.inst_id = Ustr::from("BTC-USDT-SWAP");
+        msg.inst_type = OKXInstrumentType::Swap;
+        msg.ord_type = OKXOrderType::Limit;
+        msg.side = OKXSide::Buy;
+        msg.state = OKXOrderStatus::Filled;
+        msg.sz = "2".to_string();
+        msg.acc_fill_sz = Some("2".to_string());
+        msg.fill_sz = "1".to_string();
+        msg.fill_px = "100".to_string();
+        msg.avg_px = "100".to_string();
+        msg.px = "100".to_string();
+        msg.fee = Some("-0.02".to_string());
+        msg.fee_ccy = Ustr::from("USDT");
+        msg.fill_fee = None;
+        msg.fill_fee_ccy = None;
+        let client_order_id = ClientOrderId::from(msg.cl_ord_id.as_str());
+        let venue_order_id = VenueOrderId::new(msg.ord_id);
+        let trade_id = TradeId::new(&msg.trade_id);
+        let ts_event = parse_millisecond_timestamp(msg.fill_time);
+        let liquidity_side = msg.exec_type.into();
+        let state = WsDispatchState::default();
+        if tracked {
+            state.order_identities.insert(
+                client_order_id,
+                OrderIdentity {
+                    client_order_id,
+                    strategy_id: StrategyId::from("STRATEGY-001"),
+                    instrument_id: InstrumentId::from("BTC-USDT-SWAP.OKX"),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Limit,
+                },
+            );
+        }
+
+        if terminal {
+            state.insert_terminal(client_order_id);
+        }
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_test_message(
+            OKXWsMessage::Orders(vec![msg]),
+            &emitter,
+            &state,
+            &test_algo_instruments(),
+        );
+        let ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(fee)) =
+            receiver.try_recv().unwrap()
+        else {
+            panic!("Expected cumulative fee constraints before execution evidence");
+        };
+        assert_eq!(fee.venue_order_id, venue_order_id);
+        assert_eq!(fee.client_order_id, Some(client_order_id));
+        assert_eq!(fee.boundary_quantity, Some(Decimal::from(2)));
+        assert_eq!(fee.constraints[0].amount, Some("0.02".parse().unwrap()));
+        assert_eq!(fee.constraints[0].currency, Some(Currency::USDT()));
+        let events = drain_execution_events(&mut receiver);
+        assert_eq!(events.len(), 2);
+        let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+            &events[0]
+        else {
+            panic!(
+                "expected unresolved native stream evidence, was {:?}",
+                events[0]
+            );
+        };
+        assert_eq!(report.venue_order_id, venue_order_id);
+        assert_eq!(report.client_order_id, Some(client_order_id));
+        assert_eq!(report.filled_qty, Quantity::from("2"));
+        assert!(fills.is_empty());
+        let ExecutionEvent::Report(CommonExecutionReport::IncompleteFill(incomplete)) = &events[1]
+        else {
+            panic!("Expected independently known fill facts: {:?}", events[1]);
+        };
+        assert_eq!(incomplete.account_id, report.account_id);
+        assert_eq!(incomplete.instrument_id, report.instrument_id);
+        assert_eq!(incomplete.venue_order_id, venue_order_id);
+        assert_eq!(incomplete.client_order_id, Some(client_order_id));
+        assert_eq!(incomplete.trade_id, Some(trade_id));
+        assert_eq!(incomplete.order_side, OrderSide::Buy);
+        assert_eq!(incomplete.last_qty, Some(Decimal::ONE));
+        assert_eq!(incomplete.last_px, Some(Decimal::from(100)));
+        assert_eq!(incomplete.commission_amount, None);
+        assert_eq!(incomplete.commission_currency, None);
+        assert!(!incomplete.unrepresentable_values);
+        assert_eq!(incomplete.liquidity_side, Some(liquidity_side));
+        assert_eq!(incomplete.ts_event, Some(ts_event));
+    }
+
+    #[rstest]
+    fn status_only_completion_retains_cumulative_evidence_without_inventing_a_trade(
+        #[values("tracked", "external", "terminal")] route: &str,
+        #[values(OKXInstrumentType::Spot, OKXInstrumentType::Margin)] product: OKXInstrumentType,
+        #[values("", "0", "0.00000000")] zero: &str,
+        #[values("", "size", "price", "time", "fee", "liquidity")] contradiction: &str,
+    ) {
+        let mut msg = load_regular_order_messages("ws_orders.json").remove(0);
+        msg.inst_id = Ustr::from("BTC-USDC");
+        msg.inst_type = product;
+        msg.ord_type = OKXOrderType::Market;
+        msg.side = OKXSide::Buy;
+        msg.state = OKXOrderStatus::Filled;
+        msg.sz = "0.002".to_string();
+        msg.acc_fill_sz = Some("0.002".to_string());
+        msg.fill_sz = zero.to_string();
+        msg.fill_px.clear();
+        msg.trade_id.clear();
+        msg.fill_time = 0;
+        msg.exec_type = OKXExecType::None;
+        msg.fill_fee = Some(String::new());
+        msg.fill_pnl = Some(String::new());
+        msg.avg_px = "100000".to_string();
+        msg.fee = Some("-0.02".to_string());
+        msg.fee_ccy = Ustr::from("USDC");
+        msg.px.clear();
+        msg.tgt_ccy = Some(OKXTargetCurrency::BaseCcy);
+        match contradiction {
+            "size" => msg.fill_sz = "0.002".to_string(),
+            "price" => msg.fill_px = "100000".to_string(),
+            "time" => msg.fill_time = 1,
+            "fee" => msg.fill_fee = Some("-0.02".to_string()),
+            "liquidity" => msg.exec_type = OKXExecType::Taker,
+            "" => {}
+            _ => unreachable!(),
+        }
+        let client_order_id = ClientOrderId::from(msg.cl_ord_id.as_str());
+        let instrument = CurrencyPair::builder()
+            .instrument_id(InstrumentId::from("BTC-USDC.OKX"))
+            .raw_symbol(Symbol::from("BTC-USDC"))
+            .base_currency(Currency::BTC())
+            .quote_currency(Currency::USDC())
+            .price_precision(2)
+            .size_precision(8)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.00000001"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let instruments = AtomicMap::new();
+        instruments.insert(msg.inst_id, InstrumentAny::CurrencyPair(instrument));
+        let state = WsDispatchState::default();
+        if route == "tracked" {
+            state.order_identities.insert(
+                client_order_id,
+                OrderIdentity {
+                    client_order_id,
+                    strategy_id: StrategyId::from("STRATEGY-001"),
+                    instrument_id: InstrumentId::from("BTC-USDC.OKX"),
+                    order_side: OrderSide::Buy,
+                    order_type: OrderType::Market,
+                },
+            );
+        }
+
+        if route == "terminal" {
+            state.insert_terminal(client_order_id);
+        }
+        let (emitter, mut receiver) = test_execution_emitter();
+        dispatch_test_message(
+            OKXWsMessage::Orders(vec![msg]),
+            &emitter,
+            &state,
+            &instruments,
+        );
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(
+            &events[0],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFeeEvidence(_))
+        ));
+        assert!(events.iter().any(|event| matches!(event,
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.filled_qty == Quantity::from("0.002") && fills.is_empty()
+        )));
+        let incomplete = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ExecutionEvent::Report(CommonExecutionReport::IncompleteFill(_))
+                )
+            })
+            .count();
+        assert_eq!(incomplete, usize::from(!contradiction.is_empty()));
+        assert_eq!(events.len(), 2 + incomplete);
     }
 
     #[rstest]
@@ -2795,7 +3448,8 @@ mod tests {
                 clock,
             );
             let events = drain_execution_events(&mut receiver);
-            assert_eq!(events.len(), if tracked { 2 } else { 1 });
+            assert_eq!(events.len(), if tracked { 4 } else { 3 });
+            assert_appended_fill_evidence(&events);
             assert!(!state.contains_terminal(&client_order_id));
         }
 
@@ -2813,8 +3467,11 @@ mod tests {
         );
 
         let events = drain_execution_events(&mut receiver);
-        let fill_index = usize::from(tracked && !partial_first);
+        let fill_index = 1 + usize::from(tracked && !partial_first);
         assert_eq!(events.len(), if status_only { 1 } else { fill_index + 2 });
+        if !status_only {
+            assert_appended_fill_evidence(&events);
+        }
 
         if !status_only {
             match &events[fill_index] {
@@ -2826,17 +3483,17 @@ mod tests {
                     assert!(!tracked);
                     assert_eq!(fill.last_qty, Quantity::from(last_qty));
                 }
-                other => panic!("Expected fill before terminal status, was {other:?}"),
+                other => panic!("Expected fill after cumulative evidence, was {other:?}"),
             }
         }
 
-        let report_index = if status_only { 0 } else { fill_index + 1 };
-
-        let ExecutionEvent::Report(CommonExecutionReport::Order(report)) = &events[report_index]
+        let ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills)) =
+            &events[0]
         else {
             panic!("Expected terminal order status report");
         };
 
+        assert_eq!(fills.is_empty(), status_only);
         assert_eq!(report.client_order_id, Some(client_order_id));
         assert_eq!(report.order_status, OrderStatus::Filled);
         assert_eq!(report.quantity, Quantity::from("0.00296475"));
@@ -2858,7 +3515,12 @@ mod tests {
             &mut order_state_cache,
             clock,
         );
-        assert!(drain_execution_events(&mut receiver).is_empty());
+        let duplicate = drain_execution_events(&mut receiver);
+        if status_only {
+            assert!(duplicate.is_empty());
+        } else {
+            assert_duplicate_fill_evidence(&duplicate);
+        }
     }
 
     #[rstest]
@@ -3165,7 +3827,11 @@ mod tests {
         );
 
         let events = drain_execution_events(&mut receiver);
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
+        assert_appended_fill_evidence(&events);
+        assert!(matches!(&events[3],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
         assert!(matches!(
             &events[0],
             ExecutionEvent::Order(OrderEventAny::Accepted(accepted))
@@ -3185,7 +3851,7 @@ mod tests {
                     && triggered.venue_order_id == Some(child_venue_order_id)
         ));
         assert!(matches!(
-            &events[3],
+            &events[4],
             ExecutionEvent::Order(OrderEventAny::Filled(filled))
                 if filled.client_order_id == client_order_id
                     && filled.venue_order_id == child_venue_order_id
@@ -3197,7 +3863,7 @@ mod tests {
             &state,
             &instruments,
         );
-        assert!(drain_execution_events(&mut receiver).is_empty());
+        assert_duplicate_fill_evidence(&drain_execution_events(&mut receiver));
     }
 
     #[rstest]
@@ -3242,7 +3908,11 @@ mod tests {
         );
 
         let events = drain_execution_events(&mut receiver);
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 6);
+        assert_appended_fill_evidence(&events);
+        assert!(matches!(&events[3],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
         assert!(matches!(
             &events[0],
             ExecutionEvent::Order(OrderEventAny::Accepted(accepted))
@@ -3262,7 +3932,7 @@ mod tests {
                     && triggered.venue_order_id == Some(child_venue_order_id)
         ));
         assert!(matches!(
-            &events[3],
+            &events[4],
             ExecutionEvent::Order(OrderEventAny::Filled(filled))
                 if filled.client_order_id == client_order_id
                     && filled.venue_order_id == child_venue_order_id
@@ -3275,7 +3945,7 @@ mod tests {
             &state,
             &instruments,
         );
-        assert!(drain_execution_events(&mut receiver).is_empty());
+        assert_duplicate_fill_evidence(&drain_execution_events(&mut receiver));
     }
 
     #[rstest]
@@ -3306,9 +3976,13 @@ mod tests {
         );
 
         let events = drain_execution_events(&mut receiver);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
+        assert_appended_fill_evidence(&events);
+        assert!(matches!(&events[0],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.client_order_id == Some(ClientOrderId::new("706620792746729474_0")) && report.filled_qty.is_positive() && fills.len() == 1));
         assert!(matches!(
-            &events[0],
+            &events[1],
             ExecutionEvent::Report(CommonExecutionReport::Fill(report))
                 if report.client_order_id
                     == Some(ClientOrderId::new("706620792746729474_0"))
@@ -3585,7 +4259,11 @@ mod tests {
         );
 
         let child_events = drain_execution_events(&mut receiver);
-        assert_eq!(child_events.len(), 3);
+        assert_eq!(child_events.len(), 5);
+        assert_appended_fill_evidence(&child_events);
+        assert!(matches!(&child_events[2],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
         assert!(matches!(
             &child_events[0],
             ExecutionEvent::Order(OrderEventAny::Updated(_))
@@ -3595,7 +4273,7 @@ mod tests {
             ExecutionEvent::Order(OrderEventAny::Triggered(_))
         ));
 
-        match &child_events[2] {
+        match &child_events[3] {
             ExecutionEvent::Order(OrderEventAny::Filled(filled)) => {
                 assert_eq!(filled.client_order_id, client_order_id);
                 assert_eq!(
@@ -3666,9 +4344,13 @@ mod tests {
             &instruments,
         );
         let events = drain_execution_events(&mut receiver);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 3);
+        assert_appended_fill_evidence(&events);
+        assert!(matches!(&events[0],
+            ExecutionEvent::Report(CommonExecutionReport::OrderFillEvidence(report, fills))
+                if report.client_order_id == Some(client_order_id) && report.filled_qty.is_positive() && fills.len() == 1));
         assert!(matches!(
-            &events[0],
+            &events[1],
             ExecutionEvent::Report(CommonExecutionReport::Fill(report))
                 if report.client_order_id == Some(client_order_id)
                     && report.venue_order_id
@@ -3682,7 +4364,7 @@ mod tests {
             &state,
             &instruments,
         );
-        assert!(drain_execution_events(&mut receiver).is_empty());
+        assert_duplicate_fill_evidence(&drain_execution_events(&mut receiver));
     }
 
     #[rstest]

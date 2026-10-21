@@ -572,8 +572,10 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledRow {
             .try_get::<Option<&str>, _>("position_id")
             .map(|x| x.map(PositionId::from))?;
         let commission = row
-            .try_get::<Option<&str>, _>("commission")
-            .map(|x| x.map(|x| Money::from_str(x).unwrap()))?;
+            .try_get::<Option<&str>, _>("commission")?
+            .map(Money::from_str_exact)
+            .transpose()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
         let reconciliation = row.try_get::<bool, _>("reconciliation")?;
         let info = decode_info(row)?;
         let causation_id = causation_id_from_row(row)?;
@@ -635,7 +637,7 @@ impl<'r> FromRow<'r, PgRow> for OrderFillVoidedRow {
         let voided_qty = row.try_get::<&str, _>("quantity").map(Quantity::from)?;
         let commission_voided = row
             .try_get::<Option<&str>, _>("commission")?
-            .map(|x| Money::from_str(x).map_err(|e| sqlx::Error::Decode(e.into())))
+            .map(|x| Money::from_str_exact(x).map_err(|e| sqlx::Error::Decode(e.into())))
             .transpose()?;
         let order_side = OrderSide::from_str(row.try_get::<&str, _>("order_side")?)
             .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
@@ -1105,9 +1107,11 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotRow {
         let slippage = row.try_get::<Option<Decimal>, _>("slippage").ok().flatten();
         let commissions = row
             .try_get::<Option<Vec<String>>, _>("commissions")?
-            .map_or_else(Vec::new, |c| {
-                c.into_iter().map(|s| Money::from(&s)).collect()
-            });
+            .unwrap_or_default()
+            .iter()
+            .map(|s| Money::from_str_exact(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
         let status = row
             .try_get::<&str, _>("status")
             .map(|x| OrderStatus::from_str(x).expect("Invalid `OrderStatus`"))?;
