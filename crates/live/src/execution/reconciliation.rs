@@ -94,6 +94,8 @@ pub struct ReconciliationResult {
     pub external_orders: Vec<ExternalOrderMetadata>,
     /// Diagnostics for in-scope nonzero venue positions unrecovered after event processing.
     pub unresolved_positions: Vec<String>,
+    /// Startup history is incomplete or conflicts with retained executions.
+    pub order_fill_history_incomplete: bool,
 }
 
 /// Result of inflight order checks containing terminal events and intermediate queries.
@@ -328,7 +330,9 @@ pub(crate) async fn request_targeted_order_reports(
 
             match response {
                 Ok(Some(candidate)) if targeted_report_matches(&query, &candidate) => {
-                    if terminal_report_has_missing_fills(&candidate, query.filled_qty) {
+                    if !client.requires_order_query_fills(candidate.instrument_id)
+                        && terminal_report_has_missing_fills(&candidate, query.filled_qty)
+                    {
                         let mut command = GenerateFillReports::new(
                             UUID4::new(),
                             query.command.ts_init,

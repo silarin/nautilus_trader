@@ -54,16 +54,17 @@ use crate::{
     common::{
         consts::{OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE},
         enums::{
-            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXGreeksType,
-            OKXInstrumentStatus, OKXInstrumentType, OKXOrderCategory, OKXOrderStatus, OKXOrderType,
-            OKXSide, OKXTargetCurrency, OKXTriggerType,
+            OKXAlgoOrderStatus, OKXAlgoOrderType, OKXBookAction, OKXCandleConfirm, OKXExecType,
+            OKXGreeksType, OKXInstrumentStatus, OKXInstrumentType, OKXOrderCategory,
+            OKXOrderStatus, OKXOrderType, OKXSide, OKXTargetCurrency, OKXTriggerType,
         },
         models::OKXInstrument,
         parse::{
             determine_order_type_with_alt, is_market_price, okx_channel_to_bar_spec,
-            okx_status_to_market_action, parse_fee, parse_fee_currency, parse_funding_rate_msg,
-            parse_instrument_any, parse_instrument_id, parse_message_vec,
-            parse_millisecond_timestamp, parse_parent_client_order_id, parse_price, parse_quantity,
+            okx_status_to_market_action, parse_cumulative_fill_quantity, parse_fee,
+            parse_fee_currency, parse_funding_rate_msg, parse_instrument_any, parse_instrument_id,
+            parse_message_vec, parse_millisecond_timestamp, parse_order_trade_id,
+            parse_parent_client_order_id, parse_price, parse_quantity,
             parse_spread_order_status_report as parse_common_spread_order_status_report,
             venue_position_id,
         },
@@ -83,10 +84,9 @@ pub type FilledQtyCache = FillBaselineCache<Quantity>;
 
 /// Cumulative per-order baseline used to derive incremental fill values.
 ///
-/// OKX reports `fee` and `accFillSz` cumulatively, so a fill's incremental commission derives
-/// from the previous message for the same `ordId`, as does its quantity whenever `fillSz` is
-/// absent. Losing an open order's baseline would charge its whole cumulative fee, and its whole
-/// accumulated quantity, to the next fill.
+/// OKX reports `fee` and `accFillSz` cumulatively. Deriving a per-fill commission requires
+/// both values from the same preceding update and an exact incremental quantity match.
+/// Missing baselines require a venue per-fill fee or authoritative history recovery.
 ///
 /// Baselines are therefore split by order lifecycle. An order that can still fill keeps its
 /// baseline in full. A terminal order keeps one only to absorb reconnect replays, so those are
@@ -227,13 +227,14 @@ pub fn parse_order_event(
     let venue_order_id = VenueOrderId::new(msg.ord_id);
     let instrument_id = instrument.id();
 
-    let has_new_fill = (!msg.fill_sz.is_empty() && msg.fill_sz != "0")
-        || !msg.trade_id.is_empty()
-        || has_acc_fill_sz_increased(
-            msg.acc_fill_sz.as_deref(),
-            previous_filled_qty,
-            instrument.size_precision(),
-        );
+    let has_new_fill = !is_status_only_order_update(msg)
+        && ((!msg.fill_sz.is_empty() && msg.fill_sz != "0")
+            || !msg.trade_id.is_empty()
+            || has_acc_fill_sz_increased(
+                msg.acc_fill_sz.as_deref(),
+                previous_filled_qty,
+                instrument.size_precision(),
+            ));
 
     warn_unrecognized_order_state(msg);
 
@@ -475,34 +476,6 @@ pub fn parse_spread_order_event(
 
 /// Case-insensitive substring check.
 #[inline]
-/// Builds a deterministic synthesized `TradeId` for fills where OKX omits
-/// the venue `trade_id`. Hashes the immutable fill fields with FNV-1a so
-/// the result fits inside the 36-character `TradeId` cap and stays stable
-/// across reconnect replays of the same physical fill.
-fn synthesize_trade_id(msg: &OKXOrderMsg) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0100_0000_01b3;
-
-    let mut hasher: u64 = FNV_OFFSET;
-    let mut update = |bytes: &[u8]| {
-        for byte in bytes {
-            hasher ^= u64::from(*byte);
-            hasher = hasher.wrapping_mul(FNV_PRIME);
-        }
-        // Field separator so that "ab" + "c" doesn't hash to the same as "a" + "bc".
-        hasher ^= 0xff;
-        hasher = hasher.wrapping_mul(FNV_PRIME);
-    };
-
-    update(msg.ord_id.as_bytes());
-    update(msg.fill_time.to_string().as_bytes());
-    update(msg.fill_sz.as_bytes());
-    update(msg.fill_px.as_bytes());
-    update(msg.acc_fill_sz.as_deref().unwrap_or("").as_bytes());
-
-    format!("synth-{hasher:016x}")
-}
-
 fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1332,6 +1305,37 @@ pub fn parse_order_msg_vec(
     Ok(order_reports)
 }
 
+fn parse_cumulative_order_fee(msg: &OKXOrderMsg) -> anyhow::Result<Money> {
+    let fee = msg
+        .fee
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing fee for cumulative order accounting"))?;
+    anyhow::ensure!(
+        !msg.fee_ccy.as_str().trim().is_empty(),
+        "Missing cumulative fee currency"
+    );
+
+    anyhow::ensure!(
+        !matches!(
+            msg.inst_type,
+            OKXInstrumentType::Spot | OKXInstrumentType::Margin
+        ) || msg.rebate.is_some(),
+        "Missing cumulative rebate; authoritative per-fill accounting is required"
+    );
+
+    if let Some(rebate) = msg.rebate.as_deref().filter(|s| !s.trim().is_empty()) {
+        anyhow::ensure!(
+            Decimal::from_str_exact(rebate)?.is_zero(),
+            "Separate cumulative rebates require authoritative per-fill accounting"
+        );
+    }
+    let currency = parse_fee_currency(msg.fee_ccy.as_str(), Decimal::from_str_exact(fee)?, || {
+        format!("cumulative fee for order {}", msg.ord_id)
+    });
+    parse_fee(Some(fee), currency)
+}
+
 /// Updates fee and fill caches from a raw OKX order message.
 ///
 /// Call after parsing each message so subsequent messages in the same batch
@@ -1344,26 +1348,94 @@ pub fn update_fee_fill_caches(
 ) {
     let is_terminal = is_terminal_order_state(msg.state);
 
-    if let Some(ref fee_str) = msg.fee
-        && !fee_str.is_empty()
-    {
-        let fee_dec = Decimal::from_str(fee_str).unwrap_or_default();
-        let fee_ccy = parse_fee_currency(msg.fee_ccy.as_str(), fee_dec, || {
-            format!("update_fee_fill_caches ord_id={}", msg.ord_id)
-        });
+    // Fee and quantity form one cumulative baseline. Advancing either alone can
+    // charge an earlier fee again after a valid per-fill-only update.
+    let baseline = (|| -> anyhow::Result<_> {
+        let fee = parse_cumulative_order_fee(msg)?;
+        let qty = msg
+            .acc_fill_sz
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing cumulative quantity"))?;
+        let quantity = parse_cumulative_fill_quantity(qty, instrument.size_precision())?;
+        anyhow::ensure!(
+            quantity.as_decimal() == Decimal::from_str_exact(qty)?,
+            "Cumulative quantity exceeds instrument precision"
+        );
+        let previous_qty = filled_qty_cache.get(&msg.ord_id).copied();
+        let previous_fee = fee_cache.get(&msg.ord_id).copied();
 
-        if let Ok(total_fee) = crate::common::parse::parse_fee(Some(fee_str.as_str()), fee_ccy) {
-            fee_cache.record(msg.ord_id, total_fee, is_terminal);
+        if let (Some(previous_qty), Some(previous_fee)) = (previous_qty, previous_fee)
+            && quantity <= previous_qty
+        {
+            // Retransmissions and status-only updates cannot rewind or change a
+            // committed cumulative baseline, even after trade deduplication eviction.
+            return Ok((previous_fee, previous_qty));
+        }
+
+        if quantity.is_positive() {
+            let last_qty = parse_quantity(&msg.fill_sz, instrument.size_precision())?;
+            let previous_qty = previous_qty.unwrap_or(Quantity::zero(instrument.size_precision()));
+            anyhow::ensure!(
+                previous_qty.checked_add(last_qty) == Some(quantity)
+                    && (previous_qty.is_zero() || previous_fee.is_some()),
+                "Cannot seed cumulative fees across missing executions"
+            );
+
+            if let Some(fill_fee) = msg.fill_fee.as_deref().filter(|fee| !fee.is_empty()) {
+                let currency = msg
+                    .fill_fee_ccy
+                    .filter(|currency| !currency.as_str().trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing per-fill fee currency"))?;
+                let currency = parse_fee_currency(
+                    currency.as_str(),
+                    Decimal::from_str_exact(fill_fee)?,
+                    || format!("per-fill fee for order {}", msg.ord_id),
+                );
+                let incremental = parse_fee(Some(fill_fee), currency)?;
+                let expected = previous_fee.map_or(Some(incremental.raw()), |previous| {
+                    (previous.currency == currency)
+                        .then(|| previous.raw().checked_add(incremental.raw()))
+                        .flatten()
+                });
+                anyhow::ensure!(
+                    fee.currency == currency && expected == Some(fee.raw()),
+                    "Cumulative fee does not match contiguous per-fill evidence"
+                );
+            }
+        }
+        Ok((fee, quantity))
+    })();
+
+    match baseline {
+        Ok((fee, qty)) => {
+            fee_cache.record(msg.ord_id, fee, is_terminal);
+            filled_qty_cache.record(msg.ord_id, qty, is_terminal);
+        }
+        Err(_) => {
+            fee_cache.remove(&msg.ord_id);
+            filled_qty_cache.remove(&msg.ord_id);
         }
     }
+}
 
-    if let Some(ref acc_fill_sz) = msg.acc_fill_sz
-        && !acc_fill_sz.is_empty()
-        && acc_fill_sz != "0"
-        && let Ok(qty) = parse_quantity(acc_fill_sz, instrument.size_precision())
-    {
-        filled_qty_cache.record(msg.ord_id, qty, is_terminal);
-    }
+// OKX status/amendment updates can carry cumulative progress without a current
+// execution, including quantity reductions after restart/import. Cumulative progress
+// still requires authoritative history; contradictory execution fields remain held.
+fn is_status_only_order_update(msg: &OKXOrderMsg) -> bool {
+    let absent_or_zero = |value: &str| {
+        value.is_empty() || value.parse::<Decimal>().is_ok_and(|value| value.is_zero())
+    };
+    matches!(
+        msg.state,
+        OKXOrderStatus::Filled | OKXOrderStatus::PartiallyFilled
+    ) && msg.trade_id.is_empty()
+        && absent_or_zero(&msg.fill_sz)
+        && msg.fill_px.is_empty()
+        && msg.fill_time == 0
+        && msg.exec_type == OKXExecType::None
+        && msg.fill_fee.as_deref().is_none_or(absent_or_zero)
+        && msg.fill_pnl.as_deref().is_none_or(absent_or_zero)
 }
 
 /// Checks if `acc_fill_sz` has increased compared to the previous filled quantity.
@@ -1408,13 +1480,14 @@ pub fn parse_order_msg(
     let previous_fee = fee_cache.get(&msg.ord_id).copied();
     let previous_filled_qty = filled_qty_cache.get(&msg.ord_id).copied();
 
-    let has_new_fill = (!msg.fill_sz.is_empty() && msg.fill_sz != "0")
-        || !msg.trade_id.is_empty()
-        || has_acc_fill_sz_increased(
-            msg.acc_fill_sz.as_deref(),
-            previous_filled_qty,
-            instrument.size_precision(),
-        );
+    let has_new_fill = !is_status_only_order_update(msg)
+        && ((!msg.fill_sz.is_empty() && msg.fill_sz != "0")
+            || !msg.trade_id.is_empty()
+            || has_acc_fill_sz_increased(
+                msg.acc_fill_sz.as_deref(),
+                previous_filled_qty,
+                instrument.size_precision(),
+            ));
 
     warn_unrecognized_order_state(msg);
 
@@ -1599,7 +1672,7 @@ pub fn parse_algo_order_status_report(
         && !msg.actual_sz.is_empty()
         && msg.actual_sz != "0"
     {
-        parse_quantity(msg.actual_sz.as_str(), instrument.size_precision())?
+        parse_cumulative_fill_quantity(msg.actual_sz.as_str(), instrument.size_precision())?
     } else {
         Quantity::zero(instrument.size_precision())
     };
@@ -1870,13 +1943,19 @@ pub fn parse_order_status_report(
             parse_quantity(&msg.sz, size_precision)?
         };
 
-        let filled_qty = parse_quantity(msg.acc_fill_sz.as_deref().unwrap_or(""), size_precision)?;
+        let filled_qty = parse_cumulative_fill_quantity(
+            msg.acc_fill_sz.as_deref().unwrap_or(""),
+            size_precision,
+        )?;
 
         (quantity_base, filled_qty)
     } else {
         // Base-quantity order: both sz and acc_fill_sz are in base currency
         let quantity = parse_quantity(&msg.sz, size_precision)?;
-        let filled_qty = parse_quantity(msg.acc_fill_sz.as_deref().unwrap_or(""), size_precision)?;
+        let filled_qty = parse_cumulative_fill_quantity(
+            msg.acc_fill_sz.as_deref().unwrap_or(""),
+            size_precision,
+        )?;
 
         (quantity, filled_qty)
     };
@@ -2113,144 +2192,80 @@ pub fn parse_fill_report(
         parse_parent_client_order_id(msg.algo_cl_ord_id.as_deref(), &msg.cl_ord_id);
     let venue_order_id = VenueOrderId::new(msg.ord_id);
 
-    // OKX may not provide a `trade_id` (some algo trigger payloads, manual
-    // settlements). Derive a deterministic id from the immutable fill fields
-    // via FNV-1a so reconnect replays of the same fill collapse to one event
-    // in the downstream `WsDispatchState::check_and_insert_trade` dedup. A
-    // random UUID4 here would defeat dedup, since each replay would mint a
-    // new id. The hash output keeps the synthesized id within `TradeId`'s
-    // 36-character cap.
-    let trade_id = if msg.trade_id.is_empty() {
-        let synthetic = synthesize_trade_id(msg);
-        TradeId::new(&synthetic)
-    } else {
-        TradeId::new(&msg.trade_id)
-    };
-
-    let order_side = OrderSide::from(msg.side);
-
-    let price_precision = instrument.price_precision();
     let size_precision = instrument.size_precision();
-
-    let price_str = if !msg.fill_px.is_empty() {
-        &msg.fill_px
-    } else if !msg.avg_px.is_empty() {
-        &msg.avg_px
-    } else {
-        &msg.px
-    };
-    let last_px = parse_price(price_str, price_precision).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse price (fill_px='{}', avg_px='{}', px='{}'): {}",
-            msg.fill_px,
-            msg.avg_px,
-            msg.px,
-            e
-        )
-    })?;
-
-    // OKX provides fillSz (incremental fill) or accFillSz (cumulative total)
-    // If fillSz is provided, use it directly as the incremental fill quantity
-    let last_qty = if !msg.fill_sz.is_empty() && msg.fill_sz != "0" {
-        parse_quantity(&msg.fill_sz, size_precision)
-            .map_err(|e| anyhow::anyhow!("Failed to parse fill_sz='{}': {e}", msg.fill_sz))?
-    } else if let Some(ref acc_fill_sz) = msg.acc_fill_sz {
-        // If fillSz is missing but accFillSz is available, calculate incremental fill
-        if !acc_fill_sz.is_empty() && acc_fill_sz != "0" {
-            let current_filled = parse_quantity(acc_fill_sz, size_precision)
-                .map_err(|e| anyhow::anyhow!("Failed to parse acc_fill_sz='{acc_fill_sz}': {e}"))?;
-
-            // Calculate incremental fill as: current_total - previous_total
-            if let Some(prev_qty) = previous_filled_qty {
-                if current_filled < prev_qty {
-                    anyhow::bail!(
-                        "Cumulative fill went backwards: acc_fill_sz='{acc_fill_sz}' < previous_filled_qty={prev_qty} \
-                         (possible stale data after reconnect)"
-                    );
-                }
-                let incremental = current_filled - prev_qty;
-                if incremental.is_zero() {
-                    log::debug!(
-                        "Skipping duplicate fill: acc_fill_sz='{acc_fill_sz}' unchanged from previous={prev_qty}"
-                    );
-                    return Ok(None);
-                }
-                incremental
-            } else {
-                // First fill, use accumulated as incremental
-                current_filled
-            }
-        } else {
-            anyhow::bail!(
-                "Cannot determine fill quantity: fill_sz is empty/zero and acc_fill_sz is empty/zero"
-            );
-        }
-    } else {
-        anyhow::bail!(
-            "Cannot determine fill quantity: fill_sz='{}' and acc_fill_sz is None",
-            msg.fill_sz
-        );
-    };
-
-    let fee_str = msg
-        .fee
+    // Independently valid per-fill fees remain observable when cumulative metadata is
+    // unusable. Dispatch then requires a fresh order query before economic admission.
+    let cumulative = msg
+        .acc_fill_sz
         .as_deref()
-        .filter(|fee| !fee.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing fee for fill report inst_id={}", msg.inst_id))?;
-    let fee_dec = Decimal::from_str(fee_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse fee '{fee_str}': {e}"))?;
+        .filter(|s| !s.is_empty())
+        .map(|value| parse_cumulative_fill_quantity(value, size_precision));
+    if let Some(Ok(cumulative)) = cumulative.as_ref()
+        && let Some(previous) = previous_filled_qty
+    {
+        let cumulative = *cumulative;
+        anyhow::ensure!(cumulative >= previous, "Cumulative fill went backwards");
+        if cumulative == previous && (msg.fill_sz.is_empty() || msg.fill_sz == "0") {
+            return Ok(None);
+        }
+    }
+    // Cumulative status, average price and fabricated IDs cannot establish a trade.
+    // Dispatch retains these observations for bounded native history recovery.
+    anyhow::ensure!(
+        parse_order_trade_id(&msg.trade_id).is_some()
+            && !msg.fill_px.trim().is_empty()
+            && msg.fill_time > 0,
+        "Fill requires venue trade identity, execution price and execution time"
+    );
+    anyhow::ensure!(
+        !msg.fill_sz.trim().is_empty() && Decimal::from_str_exact(&msg.fill_sz)? > Decimal::ZERO,
+        "Cannot determine fill quantity: incremental fill_sz is empty/zero"
+    );
+    let trade_id = TradeId::new(&msg.trade_id);
+    let order_side = OrderSide::from(msg.side);
+    let last_px = parse_price(&msg.fill_px, instrument.price_precision())?;
+    let last_qty = parse_quantity(&msg.fill_sz, size_precision)?;
+    anyhow::ensure!(
+        last_px.is_positive()
+            && last_qty.is_positive()
+            && last_px.as_decimal() == Decimal::from_str_exact(&msg.fill_px)?
+            && last_qty.as_decimal() == Decimal::from_str_exact(&msg.fill_sz)?,
+        "Fill price and quantity must be positive and exactly representable"
+    );
 
-    let fee_currency = parse_fee_currency(msg.fee_ccy.as_str(), fee_dec, || {
-        format!("fill report for inst_id={}", msg.inst_id)
-    });
+    let commission = if let Some(fill_fee) = msg.fill_fee.as_deref().filter(|fee| !fee.is_empty()) {
+        let currency = msg
+            .fill_fee_ccy
+            .filter(|currency| !currency.as_str().trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Missing currency for per-fill fee"))?;
+        let fee = Decimal::from_str_exact(fill_fee)?;
+        let currency = parse_fee_currency(currency.as_str(), fee, || {
+            format!("per-fill fee for inst_id={}", msg.inst_id)
+        });
+        parse_fee(Some(fill_fee), currency)?
+    } else {
+        let cumulative = cumulative
+            .transpose()?
+            .ok_or_else(|| anyhow::anyhow!("Missing cumulative quantity for fee accounting"))?;
+        let previous = previous_filled_qty.unwrap_or(Quantity::zero(size_precision));
+        anyhow::ensure!(
+            previous.checked_add(last_qty) == Some(cumulative)
+                && (previous.is_zero() || previous_fee.is_some()),
+            "Cannot recover a per-fill fee from incomplete cumulative history"
+        );
+        let total_fee = parse_cumulative_order_fee(msg)?;
 
-    // OKX sends fees as negative numbers (e.g., "-2.5" for a $2.5 charge), parse_fee negates to positive
-    let total_fee = parse_fee(Some(fee_str), fee_currency)
-        .map_err(|e| anyhow::anyhow!("Failed to parse fee={:?}: {}", msg.fee, e))?;
-
-    // OKX sends cumulative fees, so we subtract the previous total to get this fill's fee
-    let commission = if let Some(previous_fee) = previous_fee {
-        if total_fee.currency == previous_fee.currency {
-            let incremental = total_fee - previous_fee;
-
-            if incremental < Money::zero(fee_currency) {
-                log::debug!(
-                    "Negative incremental fee detected - likely a maker rebate or fee refund: order_id={}, total_fee={}, previous_fee={}, incremental={}",
-                    msg.ord_id.as_str(),
-                    total_fee,
-                    previous_fee,
-                    incremental,
-                );
-            }
-
-            // Skip corruption check when previous is negative (rebate), as transitions from
-            // rebate to charge legitimately have incremental > total (e.g., -1 → +2 gives +3)
-            if previous_fee >= Money::zero(fee_currency)
-                && total_fee > Money::zero(fee_currency)
-                && incremental > total_fee
-            {
-                log::error!(
-                    "Incremental fee exceeds total fee - likely fee cache corruption, using total fee as fallback: order_id={}, total_fee={}, previous_fee={}, incremental={}",
-                    msg.ord_id.as_str(),
-                    total_fee,
-                    previous_fee,
-                    incremental,
-                );
-                total_fee
-            } else {
-                incremental
-            }
-        } else {
-            log::warn!(
-                "Fee currency changed from {} to {} for order_id={}, using total fee as commission",
-                previous_fee.currency.code,
-                total_fee.currency.code,
-                msg.ord_id.as_str(),
+        if let Some(previous_fee) = previous_fee {
+            anyhow::ensure!(
+                total_fee.currency == previous_fee.currency,
+                "Cumulative fee currency changed without a per-fill fee"
             );
             total_fee
+                .checked_sub(previous_fee)
+                .ok_or_else(|| anyhow::anyhow!("Incremental commission overflow"))?
+        } else {
+            total_fee
         }
-    } else {
-        total_fee
     };
 
     let liquidity_side: LiquiditySide = msg.exec_type.into();
@@ -2667,7 +2682,7 @@ mod tests {
         let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
         let mut fee_cache = FeeCache::new();
         let mut filled_qty_cache = FilledQtyCache::new();
-        let mut msg = create_stub_order_msg("1.0", Some("2.0".to_string()), "ord-late", "");
+        let mut msg = create_stub_order_msg("2.0", Some("2.0".to_string()), "ord-late", "");
         msg.state = terminal_state;
         update_fee_fill_caches(&msg, &instrument, &mut fee_cache, &mut filled_qty_cache);
 
@@ -2677,8 +2692,8 @@ mod tests {
         update_fee_fill_caches(&msg, &instrument, &mut fee_cache, &mut filled_qty_cache);
 
         let key = msg.ord_id;
-        let fee = Money::from_decimal(dec!(0.5), Currency::USDT()).unwrap();
-        let quantity = Quantity::from("1.00000000");
+        let fee = Money::from_decimal(dec!(1.0), Currency::USDT()).unwrap();
+        let quantity = Quantity::from("2.00000000");
 
         assert_eq!(fee_cache.open.len(), 0);
         assert_eq!(filled_qty_cache.open.len(), 0);
@@ -2686,6 +2701,37 @@ mod tests {
         assert_eq!(filled_qty_cache.terminal.get(&key), Some(&quantity));
         assert_eq!(fee_cache.get(&key), Some(&fee));
         assert_eq!(filled_qty_cache.get(&key), Some(&quantity));
+    }
+
+    #[rstest]
+    #[case::duplicate("0.01", "-0.04", Some("-0.01"), true)]
+    #[case::missing_predecessor("0.03", "-0.03", Some("-0.01"), false)]
+    #[case::inconsistent_cumulative("0.02", "-0.04", Some("-0.01"), false)]
+    fn cumulative_baseline_requires_contiguous_unchanged_evidence(
+        #[case] cumulative: &str,
+        #[case] fee: &str,
+        #[case] fill_fee: Option<&str>,
+        #[case] retained: bool,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let mut fees = FeeCache::new();
+        let mut quantities = FilledQtyCache::new();
+        let mut msg = create_stub_order_msg("0.01", Some("0.01".into()), "baseline", "trade-1");
+        msg.fee = Some("-0.01".into());
+        update_fee_fill_caches(&msg, &instrument, &mut fees, &mut quantities);
+        msg.acc_fill_sz = Some(cumulative.into());
+        msg.fee = Some(fee.into());
+        msg.fill_fee = fill_fee.map(str::to_string);
+        msg.fill_fee_ccy = Some(Ustr::from("USDT"));
+        update_fee_fill_caches(&msg, &instrument, &mut fees, &mut quantities);
+        assert_eq!(
+            fees.get(&msg.ord_id).copied(),
+            retained.then(|| Money::from("0.01 USDT"))
+        );
+        assert_eq!(
+            quantities.get(&msg.ord_id).copied(),
+            retained.then(|| Quantity::from("0.01000000"))
+        );
     }
 
     #[rstest]
@@ -3650,7 +3696,7 @@ mod tests {
     #[rstest]
     fn test_parse_fill_report_rejects_missing_fee() {
         let instrument = create_stub_instrument();
-        let mut msg = create_stub_order_msg("0.01", None, "ord-1", "trade-1");
+        let mut msg = create_stub_order_msg("0.01", Some("0.01".into()), "ord-1", "trade-1");
         msg.fee = None;
 
         let error = parse_fill_report(
@@ -4527,6 +4573,309 @@ mod tests {
     }
 
     #[rstest]
+    #[case("-0.03", "USD", "0.03 USD")]
+    #[case("0.01", "USD", "-0.01 USD")]
+    fn test_parse_fill_report_uses_current_fee_without_stale_cumulative_fee(
+        #[case] fee: &str,
+        #[case] currency: &str,
+        #[case] expected: &str,
+        #[values(false, true)] contiguous: bool,
+    ) {
+        let mut msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        msg.fee = Some("-0.05".to_string());
+        msg.fee_ccy = Ustr::from("USDT");
+        msg.fill_fee = Some(fee.to_string());
+        msg.fill_fee_ccy = Some(Ustr::from(currency));
+        let report = parse_fill_report(
+            &msg,
+            &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+            AccountId::new("OKX-001"),
+            None,
+            contiguous.then(|| Quantity::from("0.01")),
+            UnixNanos::default(),
+        );
+        assert_eq!(report.unwrap().unwrap().commission, Money::from(expected));
+    }
+
+    #[rstest]
+    #[case("quantity_empty")]
+    #[case("quantity_zero")]
+    #[case("price")]
+    #[case("identity")]
+    #[case("placeholder_identity")]
+    #[case("time")]
+    fn test_parse_fill_report_rejects_fee_without_incremental_evidence(
+        #[case] missing: &str,
+        #[values(false, true)] current_fee: bool,
+    ) {
+        let mut msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        msg.fee = Some("-0.05".to_string());
+        msg.fill_fee = current_fee.then(|| "-0.03".to_string());
+        msg.fill_fee_ccy = current_fee.then(|| Ustr::from("USDT"));
+
+        match missing {
+            "quantity_empty" => msg.fill_sz.clear(),
+            "quantity_zero" => msg.fill_sz = "0".to_string(),
+            "price" => msg.fill_px.clear(),
+            "identity" => msg.trade_id.clear(),
+            "placeholder_identity" => msg.trade_id = "0".to_string(),
+            "time" => msg.fill_time = 0,
+            _ => unreachable!(),
+        }
+
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                None,
+                None,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_cumulative_fee_difference_respects_money_bounds(#[values(false, true)] rebate: bool) {
+        use nautilus_model::types::money::{MONEY_RAW_MAX, MONEY_RAW_MIN};
+
+        let currency = Currency::USDT();
+        let total = Money::from_raw(if rebate { MONEY_RAW_MIN } else { MONEY_RAW_MAX }, currency);
+        let previous = Money::from_raw(if rebate { 1 } else { -1 }, currency);
+        let mut msg = create_stub_order_msg("0.01", Some("0.02".into()), "1234567890", "trade_2");
+        msg.fee = Some((-total.as_decimal()).to_string());
+        let result = parse_fill_report(
+            &msg,
+            &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+            AccountId::new("OKX-001"),
+            Some(previous),
+            Some(Quantity::from("0.01")),
+            UnixNanos::default(),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Incremental commission overflow")
+        );
+    }
+
+    #[rstest]
+    #[case(None, Some("0.02"))]
+    #[case(Some("invalid"), Some("0.02"))]
+    #[case(Some("-0.03"), None)]
+    #[case(Some("-0.03"), Some("invalid"))]
+    fn test_current_fill_fee_invalidates_incomplete_cumulative_baseline(
+        #[case] cumulative_fee: Option<&str>,
+        #[case] cumulative_qty: Option<&str>,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let account = AccountId::new("OKX-001");
+        let mut fees = FeeCache::new();
+        let mut quantities = FilledQtyCache::new();
+        let mut msg = create_stub_order_msg("0.01", Some("0.01".into()), "1234567890", "trade_1");
+        msg.fee = Some("-0.01".into());
+        let first = parse_fill_report(&msg, &instrument, account, None, None, UnixNanos::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.commission, Money::from("0.01 USDT"));
+        update_fee_fill_caches(&msg, &instrument, &mut fees, &mut quantities);
+        msg.trade_id = "trade_2".into();
+        msg.fill_fee = Some("-0.02".into());
+        msg.fill_fee_ccy = Some(Ustr::from("USDT"));
+        msg.fee = cumulative_fee.map(str::to_string);
+        msg.acc_fill_sz = cumulative_qty.map(str::to_string);
+        // Individual fee evidence remains observable without a cumulative baseline.
+        let second = parse_fill_report(
+            &msg,
+            &instrument,
+            account,
+            fees.get(&msg.ord_id).copied(),
+            quantities.get(&msg.ord_id).copied(),
+            UnixNanos::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.commission, Money::from("0.02 USDT"));
+        update_fee_fill_caches(&msg, &instrument, &mut fees, &mut quantities);
+        assert!(fees.get(&msg.ord_id).is_none());
+        assert!(quantities.get(&msg.ord_id).is_none());
+        msg.trade_id = "trade_3".into();
+        msg.fill_fee = None;
+        msg.acc_fill_sz = Some("0.03".into());
+        msg.fee = Some("-0.06".into());
+        assert!(
+            parse_fill_report(
+                &msg,
+                &instrument,
+                account,
+                fees.get(&msg.ord_id).copied(),
+                quantities.get(&msg.ord_id).copied(),
+                UnixNanos::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(""))]
+    #[case(Some("invalid"))]
+    #[case(Some("0.010000000000000000000000000001"))]
+    fn test_cumulative_fee_requires_exact_cumulative_quantity(#[case] quantity: Option<&str>) {
+        let mut msg = create_stub_order_msg(
+            "0.01",
+            quantity.map(str::to_string),
+            "1234567890",
+            "trade_1",
+        );
+        msg.fee = Some("-0.01".into());
+        msg.fill_fee = None;
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                None,
+                None,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_parse_fill_report_rejects_missing_current_fee_after_missed_fill() {
+        let mut msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        msg.fee = Some("-0.05".to_string());
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                None,
+                None,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case(Some("invalid"), Some("USD"))]
+    #[case(Some("-0.03"), None)]
+    #[case(Some("-0.03"), Some(""))]
+    fn test_parse_fill_report_rejects_invalid_current_fill_fee(
+        #[case] fee: Option<&str>,
+        #[case] currency: Option<&str>,
+    ) {
+        let mut msg =
+            create_stub_order_msg("0.01", Some("0.02".to_string()), "1234567890", "trade_2");
+        msg.fill_fee = fee.map(str::to_string);
+        msg.fill_fee_ccy = currency.map(Ustr::from);
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                None,
+                None,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case::missing_currency("", None)]
+    #[case::separate_rebate("USDT", Some("0.01"))]
+    #[case::invalid_rebate("USDT", Some("invalid"))]
+    fn test_cumulative_fee_requires_unambiguous_currency_and_rebate(
+        #[case] currency: &str,
+        #[case] rebate: Option<&str>,
+    ) {
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
+        let mut msg = create_stub_order_msg("0.01", Some("0.01".into()), "1234567890", "trade_1");
+        msg.fee = Some("0".into());
+        msg.fee_ccy = Ustr::from(currency);
+        msg.rebate = rebate.map(str::to_string);
+        let account = AccountId::new("OKX-001");
+        assert!(
+            parse_fill_report(&msg, &instrument, account, None, None, UnixNanos::default())
+                .is_err()
+        );
+        let mut fees = FeeCache::new();
+        let mut quantities = FilledQtyCache::new();
+        fees.record(msg.ord_id, Money::from("0.01 USDT"), false);
+        quantities.record(msg.ord_id, Quantity::from("0.01"), false);
+        update_fee_fill_caches(&msg, &instrument, &mut fees, &mut quantities);
+        assert!(fees.get(&msg.ord_id).is_none());
+        assert!(quantities.get(&msg.ord_id).is_none());
+        // The venue's explicit per-fill fee remains authoritative even when the
+        // cumulative fee/rebate pair cannot establish an incremental commission.
+        msg.fill_fee = Some("0.01".into());
+        msg.fill_fee_ccy = Some(Ustr::from("USDT"));
+        let fill = parse_fill_report(&msg, &instrument, account, None, None, UnixNanos::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(fill.commission, Money::from("-0.01 USDT"));
+    }
+
+    #[rstest]
+    #[case::price("50000.001", "0.01")]
+    #[case::quantity("50000.00", "0.010000001")]
+    #[case::zero_price("0", "0.01")]
+    fn test_parse_fill_report_rejects_inexact_execution_values(
+        #[case] price: &str,
+        #[case] quantity: &str,
+    ) {
+        let mut msg = create_stub_order_msg(quantity, Some("0.01".into()), "1234567890", "trade_1");
+        msg.fill_px = price.into();
+        msg.fill_fee = Some("-0.01".into());
+        msg.fill_fee_ccy = Some(Ustr::from("USDT"));
+        let error = parse_fill_report(
+            &msg,
+            &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+            AccountId::new("OKX-001"),
+            None,
+            None,
+            UnixNanos::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly representable"));
+    }
+
+    #[rstest]
+    #[case::price("50000.000000000000000000000000001", "0.01", "-0.01")]
+    #[case::quantity("50000.00", "0.010000000000000000000000000001", "-0.01")]
+    #[case::fee("50000.00", "0.01", "-0.010000000000000000000000000001")]
+    fn test_parse_fill_report_rejects_decimal_rounding(
+        #[case] price: &str,
+        #[case] quantity: &str,
+        #[case] fee: &str,
+    ) {
+        let mut msg = create_stub_order_msg(quantity, Some("0.01".into()), "1234567890", "trade_1");
+        msg.fill_px = price.into();
+        msg.fill_fee = Some(fee.into());
+        msg.fill_fee_ccy = Some(Ustr::from("USDT"));
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                None,
+                None,
+                UnixNanos::default(),
+            )
+            .is_err()
+        );
+    }
+
+    #[rstest]
     fn test_parse_fill_report_fee_currency_change_no_panic() {
         let instrument = create_stub_instrument();
         let account_id = AccountId::new("OKX-001");
@@ -4550,70 +4899,36 @@ mod tests {
             ts_init,
         );
 
-        let fill_report = result.unwrap().unwrap();
-        assert_eq!(fill_report.commission.currency, Currency::BTC());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cumulative fee currency changed")
+        );
     }
 
     #[rstest]
-    fn test_parse_fill_report_empty_fill_sz_first_fill() {
-        let instrument = create_stub_instrument();
-        let account_id = AccountId::new("OKX-001");
-        let ts_init = UnixNanos::default();
-
-        let order_msg =
-            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_1");
-
-        let fill_report = parse_fill_report(
-            &order_msg,
-            &InstrumentAny::CryptoPerpetual(instrument),
-            account_id,
-            None,
-            None,
-            ts_init,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(fill_report.last_qty, Quantity::from("0.01"));
-    }
-
-    #[rstest]
-    fn test_parse_fill_report_empty_fill_sz_subsequent_fills() {
-        let instrument = create_stub_instrument();
-        let account_id = AccountId::new("OKX-001");
-        let ts_init = UnixNanos::default();
-
-        let order_msg_1 =
-            create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_1");
-
-        let fill_report_1 = parse_fill_report(
-            &order_msg_1,
-            &InstrumentAny::CryptoPerpetual(instrument.clone()),
-            account_id,
-            None,
-            None,
-            ts_init,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(fill_report_1.last_qty, Quantity::from("0.01"));
-
-        let order_msg_2 =
-            create_stub_order_msg("", Some("0.03".to_string()), "1234567890", "trade_2");
-
-        let fill_report_2 = parse_fill_report(
-            &order_msg_2,
-            &InstrumentAny::CryptoPerpetual(instrument),
-            account_id,
-            Some(fill_report_1.commission),
-            Some(fill_report_1.last_qty),
-            ts_init,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(fill_report_2.last_qty, Quantity::from("0.02"));
+    #[case(None, None)]
+    #[case(
+        Some(Money::new(0.01, Currency::USDT())),
+        Some(Quantity::from("0.005"))
+    )]
+    fn test_parse_fill_report_rejects_cumulative_quantity_without_incremental_fill(
+        #[case] fee: Option<Money>,
+        #[case] qty: Option<Quantity>,
+    ) {
+        let msg = create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "trade_1");
+        assert!(
+            parse_fill_report(
+                &msg,
+                &InstrumentAny::CryptoPerpetual(create_stub_instrument()),
+                AccountId::new("OKX-001"),
+                fee,
+                qty,
+                UnixNanos::default()
+            )
+            .is_err()
+        );
     }
 
     #[rstest]
@@ -4659,7 +4974,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Cannot determine fill quantity"));
-        assert!(err_msg.contains("acc_fill_sz is None"));
+        assert!(err_msg.contains("fill_sz is empty/zero"));
     }
 
     #[rstest]
@@ -4687,61 +5002,22 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_order_msg_acc_fill_sz_only_update() {
-        // Test that we emit fill reports when OKX only updates acc_fill_sz without fill_sz or trade_id
-        let instrument = create_stub_instrument();
-        let account_id = AccountId::new("OKX-001");
-        let ts_init = UnixNanos::default();
-
+    fn test_parse_order_msg_acc_fill_sz_only_requires_recovery() {
+        let instrument = InstrumentAny::CryptoPerpetual(create_stub_instrument());
         let mut instruments = AHashMap::new();
-        instruments.insert(
-            Ustr::from("BTC-USDT-SWAP"),
-            InstrumentAny::CryptoPerpetual(instrument),
+        instruments.insert(Ustr::from("BTC-USDT-SWAP"), instrument);
+        let msg = create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "");
+        assert!(
+            parse_order_msg(
+                &msg,
+                AccountId::new("OKX-001"),
+                &instruments,
+                &FeeCache::new(),
+                &FilledQtyCache::new(),
+                UnixNanos::default()
+            )
+            .is_err()
         );
-
-        let fee_cache = FeeCache::new();
-        let mut filled_qty_cache = FilledQtyCache::new();
-
-        // First update: acc_fill_sz = 0.01, no fill_sz, no trade_id
-        let msg_1 = create_stub_order_msg("", Some("0.01".to_string()), "1234567890", "");
-
-        let report_1 = parse_order_msg(
-            &msg_1,
-            account_id,
-            &instruments,
-            &fee_cache,
-            &filled_qty_cache,
-            ts_init,
-        )
-        .unwrap();
-
-        // Should generate a fill report (not a status report)
-        assert!(matches!(report_1, ExecutionReport::Fill(_)));
-        if let ExecutionReport::Fill(fill) = &report_1 {
-            assert_eq!(fill.last_qty, Quantity::from("0.01"));
-        }
-
-        // Update cache
-        filled_qty_cache.record(Ustr::from("1234567890"), Quantity::from("0.01"), false);
-
-        // Second update: acc_fill_sz increased to 0.03, still no fill_sz or trade_id
-        let msg_2 = create_stub_order_msg("", Some("0.03".to_string()), "1234567890", "");
-
-        let report_2 = parse_order_msg(
-            &msg_2,
-            account_id,
-            &instruments,
-            &fee_cache,
-            &filled_qty_cache,
-            ts_init,
-        )
-        .unwrap();
-
-        // Should still generate a fill report for the incremental 0.02
-        assert!(matches!(report_2, ExecutionReport::Fill(_)));
-        if let ExecutionReport::Fill(fill) = &report_2 {
-            assert_eq!(fill.last_qty, Quantity::from("0.02"));
-        }
     }
 
     #[rstest]
@@ -5988,96 +6264,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_synthesize_trade_id_is_deterministic_and_under_36_chars() {
-        let mut msg = create_order_msg_for_event_test(
-            OKXOrderStatus::Filled,
-            "client-1",
-            "venue-1",
-            "50000.0",
-            "0.001",
-        );
-        msg.fill_px = "50000.0".to_string();
-        msg.fill_sz = "0.001".to_string();
-        msg.fill_time = 1_746_947_317_500;
-        msg.acc_fill_sz = Some("0.001".to_string());
-
-        let id1 = synthesize_trade_id(&msg);
-        let id2 = synthesize_trade_id(&msg);
-
-        assert_eq!(id1, id2, "synthesized id must be deterministic");
-        assert!(
-            id1.len() <= 36,
-            "synthesized id must fit in TradeId, was {}",
-            id1.len()
-        );
-        assert!(id1.starts_with("synth-"));
-    }
-
-    #[rstest]
-    fn test_synthesize_trade_id_changes_with_fill_fields() {
-        let mut msg = create_order_msg_for_event_test(
-            OKXOrderStatus::Filled,
-            "client-1",
-            "venue-1",
-            "50000.0",
-            "0.001",
-        );
-        msg.fill_px = "50000.0".to_string();
-        msg.fill_sz = "0.001".to_string();
-        msg.fill_time = 1_746_947_317_500;
-        msg.acc_fill_sz = Some("0.001".to_string());
-
-        let baseline = synthesize_trade_id(&msg);
-
-        msg.fill_sz = "0.002".to_string();
-        let different_size = synthesize_trade_id(&msg);
-        assert_ne!(baseline, different_size);
-
-        msg.fill_sz = "0.001".to_string();
-        msg.fill_time = 1_746_947_317_999;
-        let different_time = synthesize_trade_id(&msg);
-        assert_ne!(baseline, different_time);
-    }
-
-    #[rstest]
-    fn test_empty_trade_id_fill_deduped_across_replays() {
-        use crate::websocket::dispatch::WsDispatchState;
-
-        // Two identical fill messages with no venue trade_id - the dedup in
-        // `WsDispatchState::check_and_insert_trade` must suppress the replay.
-        // Regression lock for the empty-trade_id UUID fabrication bug: if
-        // `synthesize_trade_id` drifts back to a non-deterministic id, the
-        // second `check_and_insert_trade` would return false (not a dupe)
-        // and this test fails.
-        let mut msg = create_order_msg_for_event_test(
-            OKXOrderStatus::Filled,
-            "client-1",
-            "venue-1",
-            "50000.0",
-            "0.001",
-        );
-        msg.trade_id = String::new();
-        msg.fill_px = "50000.0".to_string();
-        msg.fill_sz = "0.001".to_string();
-        msg.fill_time = 1_746_947_317_500;
-        msg.acc_fill_sz = Some("0.001".to_string());
-
-        let first_id = TradeId::new(synthesize_trade_id(&msg));
-        let second_id = TradeId::new(synthesize_trade_id(&msg));
-        assert_eq!(first_id, second_id, "synthesized id must survive replay");
-
-        let state = WsDispatchState::default();
-        assert!(
-            !state.check_and_insert_trade(first_id),
-            "first insert is not a duplicate"
-        );
-        assert!(
-            state.check_and_insert_trade(second_id),
-            "replayed fill with empty trade_id must dedup"
-        );
-    }
-
-    #[rstest]
     fn test_parse_order_event_live_returns_accepted() {
         let instrument = create_stub_instrument();
         let msg = create_order_msg_for_event_test(
@@ -6504,6 +6690,7 @@ mod tests {
             "50000.0",
             "0.01",
         );
+        msg.fill_time = msg.u_time;
         msg.fill_sz = "0.01".to_string();
         msg.fill_px = "50000.0".to_string();
         msg.trade_id = "trade_789".to_string();

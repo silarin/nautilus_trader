@@ -2954,7 +2954,9 @@ impl Portfolio {
 
                     let mut pnl = sum_pnl.as_decimal();
 
-                    if let Some(conversion_currency) = conversion_currency {
+                    if let Some(conversion_currency) = conversion_currency
+                        && sum_pnl.currency != conversion_currency
+                    {
                         let xrate = if let Some(xrate) = self.calculate_xrate(
                             instrument_id.venue,
                             sum_pnl.currency,
@@ -3001,7 +3003,9 @@ impl Portfolio {
 
                     let mut pnl = realized_pnl.as_decimal();
 
-                    if let Some(conversion_currency) = conversion_currency {
+                    if let Some(conversion_currency) = conversion_currency
+                        && realized_pnl.currency != conversion_currency
+                    {
                         let xrate = if let Some(xrate) = self.calculate_xrate(
                             instrument_id.venue,
                             realized_pnl.currency,
@@ -3049,7 +3053,9 @@ impl Portfolio {
 
                     let mut pnl = sum_pnl.as_decimal();
 
-                    if let Some(conversion_currency) = conversion_currency {
+                    if let Some(conversion_currency) = conversion_currency
+                        && sum_pnl.currency != conversion_currency
+                    {
                         let xrate = if let Some(xrate) = self.calculate_xrate(
                             instrument_id.venue,
                             sum_pnl.currency,
@@ -3096,7 +3102,9 @@ impl Portfolio {
 
                     let mut pnl = realized_pnl.as_decimal();
 
-                    if let Some(conversion_currency) = conversion_currency {
+                    if let Some(conversion_currency) = conversion_currency
+                        && realized_pnl.currency != conversion_currency
+                    {
                         let xrate = if let Some(xrate) = self.calculate_xrate(
                             instrument_id.venue,
                             realized_pnl.currency,
@@ -3127,7 +3135,7 @@ impl Portfolio {
             }
         }
 
-        match Money::from_decimal(total_pnl, currency) {
+        match Money::from_decimal_exact(total_pnl, currency) {
             Ok(money) => Some(money),
             Err(e) => {
                 log::error!("Cannot calculate realized PnL: {e}");

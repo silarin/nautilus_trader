@@ -129,8 +129,27 @@ impl AccountBalance {
     ) -> CorrectnessResult<Self> {
         let total = Money::from_decimal(total, currency)?;
         let locked = Money::from_decimal(locked, currency)?;
-
         Self::from_money_total_and_locked(total, locked)
+    }
+
+    /// Creates a balance without rounding fractional currency units in derived amounts.
+    ///
+    /// Applies the same reservation clamping and fixed-point invariant as
+    /// [`Self::from_total_and_locked`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an amount is not exactly representable in native money,
+    /// or deriving the free balance exceeds its bounds.
+    pub fn from_total_and_locked_exact(
+        total: Decimal,
+        locked: Decimal,
+        currency: Currency,
+    ) -> CorrectnessResult<Self> {
+        Self::from_money_total_and_locked(
+            Money::from_decimal_exact(total, currency)?,
+            Money::from_decimal_exact(locked, currency)?,
+        )
     }
 
     /// Creates a new [`AccountBalance`] from `total` and `free` decimal amounts,
@@ -558,6 +577,32 @@ mod tests {
             stubs::{stub_account_balance, stub_margin_balance},
         },
     };
+
+    #[rstest]
+    #[case("99.988004307", "1.000000001", "98.988004306")]
+    #[case("99.988004307", "100", "0")]
+    #[case("-0.011995693", "1.000000001", "-1.011995694")]
+    fn test_exact_derived_balance_preserves_fee_and_invariant(
+        #[case] total: &str,
+        #[case] locked: &str,
+        #[case] free: &str,
+    ) {
+        let total = Decimal::from_str_exact(total).unwrap();
+        let locked = Decimal::from_str_exact(locked).unwrap();
+        let balance =
+            AccountBalance::from_total_and_locked_exact(total, locked, Currency::USD()).unwrap();
+        assert_eq!(balance.total.as_decimal(), total);
+        assert_eq!(
+            balance.free.as_decimal(),
+            Decimal::from_str_exact(free).unwrap()
+        );
+        assert_eq!(balance.total, balance.locked + balance.free);
+        let encoded = serde_json::to_vec(&balance).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AccountBalance>(&encoded).unwrap(),
+            balance
+        );
+    }
 
     #[rstest]
     fn test_has_same_currency_identity_requires_every_field() {

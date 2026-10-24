@@ -43,6 +43,7 @@ use std::{
 
 use ahash::AHashSet;
 use nautilus_core::{UUID4, UnixNanos};
+use nautilus_model::events::{OrderEventAny, OrderFilled};
 use parking_lot::Mutex;
 
 use crate::{
@@ -99,13 +100,13 @@ pub struct BusCaptureAdapter {
 // Insertion-ordered set of recently captured message identities with FIFO eviction.
 #[derive(Debug, Default)]
 struct RecentIdentities {
-    order: VecDeque<UUID4>,
-    seen: AHashSet<UUID4>,
+    order: VecDeque<(UUID4, Option<Topic>)>,
+    seen: AHashSet<(UUID4, Option<Topic>)>,
 }
 
 impl RecentIdentities {
     // Returns false when `identity` was already noted; records it otherwise.
-    fn note_fresh(&mut self, identity: UUID4) -> bool {
+    fn note_fresh(&mut self, identity: (UUID4, Option<Topic>)) -> bool {
         if self.seen.contains(&identity) {
             return false;
         }
@@ -239,10 +240,16 @@ impl BusCaptureAdapter {
             return Ok(false);
         };
 
-        if let Some(identity) = self.registry.identity_for_any(message)
-            && !self.note_fresh_identity(identity)
-        {
-            return Ok(false);
+        if let Some(identity) = self.registry.identity_for_any(message) {
+            // Order events can gain a position ID between ingress and committed
+            // publication. Retain each route so replay never substitutes the first,
+            // unapplied message for the accepted native event.
+            let route =
+                (message.is::<OrderEventAny>() || message.is::<OrderFilled>()).then_some(topic);
+
+            if !self.recent_identities.lock().note_fresh((identity, route)) {
+                return Ok(false);
+            }
         }
 
         let draft = EntryDraft {
@@ -266,10 +273,6 @@ impl BusCaptureAdapter {
                 Err(CaptureError::Submit(e))
             }
         }
-    }
-
-    fn note_fresh_identity(&self, identity: UUID4) -> bool {
-        self.recent_identities.lock().note_fresh(identity)
     }
 
     fn fail_stop(&self, err: &SubmitError) {

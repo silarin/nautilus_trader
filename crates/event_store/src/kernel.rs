@@ -1103,6 +1103,7 @@ fn build_manifest(
 ) -> RunManifest {
     let mut feature_flags = config.identity.feature_flags.clone();
     feature_flags.push(format!("retention={}", retention_tag(config.retention)));
+    feature_flags.push(crate::replay::ORDER_CAPTURE_CONTRACT.to_string());
 
     RunManifest {
         run_id,

@@ -132,8 +132,20 @@ pub const PAYLOAD_TYPE_ORDER_FILL_VOIDED: &str = "OrderFillVoided";
 pub const PAYLOAD_TYPE_ORDER_STATUS_REPORT: &str = "OrderStatusReport";
 /// The canonical `payload_type` tag for [`FillReport`].
 pub const PAYLOAD_TYPE_FILL_REPORT: &str = "FillReport";
+/// Native observation requiring a fresh complete order query.
+pub const PAYLOAD_TYPE_FILL_QUERY_REQUIRED: &str = "FillQueryRequired";
+/// Incomplete native execution facts requiring a fresh authoritative query.
+pub const PAYLOAD_TYPE_INCOMPLETE_FILL: &str = "IncompleteFill";
+/// Cumulative commission constraints without execution authority.
+pub const PAYLOAD_TYPE_ORDER_FEE_EVIDENCE: &str = "OrderFeeEvidence";
 /// The canonical `payload_type` tag for the [`ExecutionReport::OrderWithFills`] bundle.
 pub const PAYLOAD_TYPE_ORDER_WITH_FILLS: &str = "OrderWithFills";
+/// The canonical `payload_type` tag for the [`ExecutionReport::OrderQueryWithFills`] bundle.
+pub const PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS: &str = "OrderQueryWithFills";
+/// Canonical tag for contradictory execution evidence retained across restarts.
+pub const PAYLOAD_TYPE_ORDER_FILL_CONFLICT: &str = "OrderFillConflict";
+/// Canonical tag for individual stream evidence constraining native accounting.
+pub const PAYLOAD_TYPE_ORDER_FILL_EVIDENCE: &str = "OrderFillEvidence";
 /// The canonical `payload_type` tag for [`PositionStatusReport`].
 pub const PAYLOAD_TYPE_POSITION_STATUS_REPORT: &str = "PositionStatusReport";
 /// The canonical `payload_type` tag for [`ExecutionMassStatus`].
@@ -239,7 +251,13 @@ pub(crate) const DEFAULT_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_FILL_VOIDED,
     PAYLOAD_TYPE_ORDER_STATUS_REPORT,
     PAYLOAD_TYPE_FILL_REPORT,
+    PAYLOAD_TYPE_FILL_QUERY_REQUIRED,
+    PAYLOAD_TYPE_INCOMPLETE_FILL,
     PAYLOAD_TYPE_ORDER_WITH_FILLS,
+    PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+    PAYLOAD_TYPE_ORDER_FEE_EVIDENCE,
+    PAYLOAD_TYPE_ORDER_FILL_CONFLICT,
+    PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
     PAYLOAD_TYPE_POSITION_STATUS_REPORT,
     PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
     PAYLOAD_TYPE_POSITION_OPENED,
@@ -378,7 +396,8 @@ fn register_default_headers(registry: &mut EncoderRegistry) {
 /// than one tap-visible boundary (portfolio endpoint send plus strategy topic publish,
 /// command hops through risk to execution, account states on both dispatch paths, data
 /// commands through the queue endpoint and the drained execute endpoint), so the
-/// adapter captures each logical message exactly once. The venue report types
+/// adapter deduplicates repeated messages. Order events retain one copy per route,
+/// distinguishing unapplied ingress from committed strategy publication. The venue report types
 /// deliberately carry no extractor: the raw `reconciliation.raw.*` publish and the
 /// engine-bound dispatch are distinct capture boundaries.
 fn register_default_identities(registry: &mut EncoderRegistry) {
@@ -420,7 +439,7 @@ fn extract_trading_command_identity(command: &TradingCommand) -> UUID4 {
     }
 }
 
-fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
+pub(crate) fn extract_order_event_any_identity(event: &OrderEventAny) -> UUID4 {
     match event {
         OrderEventAny::Initialized(e) => e.event_id,
         OrderEventAny::Denied(e) => e.event_id,
@@ -650,8 +669,54 @@ pub fn encode_execution_report(report: &ExecutionReport) -> Result<EncodedPayloa
             encode_order_status_report(r)?,
             PAYLOAD_TYPE_ORDER_STATUS_REPORT,
         )),
-        ExecutionReport::Fill(r) => encode_fill_report(r),
+        ExecutionReport::Fill(r) | ExecutionReport::FillEvidence(r) => encode_fill_report(r),
+        ExecutionReport::FillQueryRequired(r) => Ok(retag(
+            encode_fill_report(r)?,
+            PAYLOAD_TYPE_FILL_QUERY_REQUIRED,
+        )),
+        ExecutionReport::IncompleteFill(r) => {
+            let mut indexes = vec![IndexKey::new(
+                IndexKind::VenueOrderId,
+                r.venue_order_id.to_string(),
+            )];
+
+            if let Some(id) = r.client_order_id {
+                indexes.push(IndexKey::new(IndexKind::ClientOrderId, id.to_string()));
+            }
+            Ok(EncodedPayload::with_payload_type(
+                payload_type(PAYLOAD_TYPE_INCOMPLETE_FILL),
+                encode_serde(r.as_ref())?,
+                indexes,
+            ))
+        }
+        ExecutionReport::OrderFeeEvidence(r) => {
+            let mut indexes = vec![IndexKey::new(
+                IndexKind::VenueOrderId,
+                r.venue_order_id.to_string(),
+            )];
+
+            if let Some(id) = r.client_order_id {
+                indexes.push(IndexKey::new(IndexKind::ClientOrderId, id.to_string()));
+            }
+            Ok(EncodedPayload::with_payload_type(
+                payload_type(PAYLOAD_TYPE_ORDER_FEE_EVIDENCE),
+                encode_serde(r.as_ref())?,
+                indexes,
+            ))
+        }
         ExecutionReport::OrderWithFills(order, fills) => encode_order_with_fills(order, fills),
+        ExecutionReport::OrderQueryWithFills(order, fills) => Ok(retag(
+            encode_order_with_fills(order, fills)?,
+            PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+        )),
+        ExecutionReport::OrderFillEvidence(order, fills) => Ok(retag(
+            encode_order_with_fills(order, fills)?,
+            PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
+        )),
+        ExecutionReport::OrderFillConflict(r) => Ok(retag(
+            encode_order_status_report(r)?,
+            PAYLOAD_TYPE_ORDER_FILL_CONFLICT,
+        )),
         ExecutionReport::Position(r) => encode_position_status_report(r),
         ExecutionReport::MassStatus(s) => encode_execution_mass_status(s),
     }
@@ -1520,14 +1585,17 @@ fn encode_bars_response(response: &BarsResponse) -> Result<EncodedPayload, Encod
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::messages::data::{
-        RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes, UnsubscribeCommand,
-        UnsubscribeQuotes,
-    };
     #[cfg(feature = "defi")]
     use nautilus_common::messages::defi::{
         DefiRequestCommand, DefiSubscribeCommand, DefiUnsubscribeCommand, RequestPoolSnapshot,
         SubscribeBlocks, UnsubscribeBlocks,
+    };
+    use nautilus_common::messages::{
+        data::{
+            RequestCommand, RequestQuotes, SubscribeCommand, SubscribeQuotes, UnsubscribeCommand,
+            UnsubscribeQuotes,
+        },
+        execution::IncompleteFillReport,
     };
     use nautilus_core::{DurationNanos, UUID4, UnixNanos};
     #[cfg(feature = "defi")]
@@ -2661,7 +2729,7 @@ mod tests {
     }
 
     #[rstest]
-    fn execution_report_order_with_fills_payload_round_trips() {
+    fn execution_report_order_with_fills_payload_round_trips(#[values(false, true)] queried: bool) {
         #[derive(serde::Deserialize)]
         struct OrderWithFillsOwned {
             order_report: OrderStatusReport,
@@ -2670,8 +2738,21 @@ mod tests {
 
         let order = make_order_status_report();
         let fills = vec![make_fill_report()];
-        let envelope = ExecutionReport::OrderWithFills(Box::new(order.clone()), fills.clone());
+        let envelope = if queried {
+            ExecutionReport::OrderQueryWithFills(Box::new(order.clone()), fills.clone())
+        } else {
+            ExecutionReport::OrderWithFills(Box::new(order.clone()), fills.clone())
+        };
         let encoded = encode_execution_report(&envelope).expect("encode");
+        assert_eq!(
+            encoded.payload_type.expect("override").as_str(),
+            if queried {
+                PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS
+            } else {
+                PAYLOAD_TYPE_ORDER_WITH_FILLS
+            },
+        );
+        assert_eq!(encoded.index_keys.len(), 2);
 
         let decoded: OrderWithFillsOwned = rmp_serde::from_slice(&encoded.payload).expect("decode");
         assert_eq!(decoded.order_report, order);
@@ -2769,6 +2850,40 @@ mod tests {
             vec![make_fill_report()],
         ),
         PAYLOAD_TYPE_ORDER_WITH_FILLS,
+    )]
+    #[case::order_query_with_fills(
+        ExecutionReport::OrderQueryWithFills(
+            Box::new(make_order_status_report()),
+            vec![make_fill_report()],
+        ),
+        PAYLOAD_TYPE_ORDER_QUERY_WITH_FILLS,
+    )]
+    #[case::order_fill_evidence(
+        ExecutionReport::OrderFillEvidence(Box::new(make_order_status_report()), vec![make_fill_report()]),
+        PAYLOAD_TYPE_ORDER_FILL_EVIDENCE,
+    )]
+    #[case::fill_query_required(
+        ExecutionReport::FillQueryRequired(Box::new(make_fill_report())),
+        PAYLOAD_TYPE_FILL_QUERY_REQUIRED
+    )]
+    #[case::incomplete_fill(
+        ExecutionReport::IncompleteFill(Box::new(IncompleteFillReport {
+            account_id: AccountId::from("OKX-001"), instrument_id: instrument_id(),
+            venue_order_id: venue_order_id(), client_order_id: Some(client_order_id()),
+            trade_id: Some(TradeId::from("T-001")), order_side: OrderSide::Buy,
+            trade_id_placeholder: false,
+            last_qty: None, last_px: None, commission_amount: None, commission_currency: None, unrepresentable_values: false, requires_fresh_query: true, order_snapshot: None, liquidity_side: None,
+            venue_position_id: None, ts_event: None, ts_init: UnixNanos::from(1),
+        })),
+        PAYLOAD_TYPE_INCOMPLETE_FILL
+    )]
+    #[case::fill_evidence(
+        ExecutionReport::FillEvidence(Box::new(make_fill_report())),
+        PAYLOAD_TYPE_FILL_REPORT
+    )]
+    #[case::order_fill_conflict(
+        ExecutionReport::OrderFillConflict(Box::new(make_order_status_report())),
+        PAYLOAD_TYPE_ORDER_FILL_CONFLICT
     )]
     #[case::position(
         ExecutionReport::Position(Box::new(make_position_status_report())),

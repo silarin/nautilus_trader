@@ -8898,12 +8898,24 @@ async fn test_http_request_spot_margin_position_reports_prefers_currency_pair() 
 }
 
 #[rstest]
+#[case("fee", json!(""), "missing fee")]
+#[case("feeCcy", json!(""), "fee currency")]
+#[case("fillTime", json!(null), "execution time")]
+#[case("tradeId", json!(""), "trade identity")]
+#[case("fillSz", json!("0.010000001"), "represented exactly")]
+#[case("fillPx", json!("42000.5000001"), "represented exactly")]
 #[tokio::test]
-async fn test_http_request_fill_reports_fails_closed_on_missing_fee() {
+async fn test_http_request_fill_reports_fails_closed_on_ambiguous_execution(
+    #[case] field: &str,
+    #[case] value: Value,
+    #[case] expected: &str,
+) {
     let mut fill = load_test_data("http_transaction_detail_empty_fee.json");
     fill["instType"] = json!("SWAP");
     fill["instId"] = json!("ETH-USDT-SWAP");
     fill["fillSz"] = json!("0.01");
+    fill["fee"] = json!("-0.01");
+    fill[field] = value;
     let router = Router::new().route(
         "/api/v5/trade/fills",
         get(move || {
@@ -8950,10 +8962,7 @@ async fn test_http_request_fill_reports_fails_closed_on_missing_fee() {
         .await
         .unwrap_err();
 
-    assert!(
-        format!("{error:#}").contains("missing fee"),
-        "was {error:#}"
-    );
+    assert!(format!("{error:#}").contains(expected), "was {error:#}");
 }
 
 #[rstest]
@@ -9011,6 +9020,79 @@ async fn test_http_request_fill_reports_skips_out_of_window_missing_fee() {
         .unwrap();
 
     assert!(reports.is_empty());
+}
+
+#[rstest]
+#[case(1_000, 999, true)]
+#[case(1_001, 1_000, false)]
+#[case(999, 998, false)]
+#[tokio::test]
+async fn test_bounded_fill_reports_preserve_record_timestamp_windows(
+    #[case] record_time: u64,
+    #[case] execution_time: u64,
+    #[case] included: bool,
+) {
+    let mut fill = load_test_data("http_transaction_detail_empty_fee.json");
+    fill["instType"] = json!("SWAP");
+    fill["instId"] = json!("ETH-USDT-SWAP");
+    fill["fillSz"] = json!("0.01");
+    fill["fee"] = json!("-0.01");
+    fill["feeCcy"] = json!("USDT");
+    fill["ts"] = json!(record_time.to_string());
+    fill["fillTime"] = json!(execution_time.to_string());
+    let router = Router::new().route(
+        "/api/v5/trade/fills",
+        get(move |Query(params): Query<HashMap<String, String>>| {
+            let fill = fill.clone();
+            async move {
+                assert_eq!(params.get("begin").unwrap(), "1000");
+                assert_eq!(params.get("end").unwrap(), "1000");
+                Json(okx_response(&[fill]))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = OKXHttpClient::with_credentials(
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        Some(format!("http://{addr}")),
+        60,
+        0,
+        1000,
+        10_000,
+        OKXEnvironment::Demo,
+        None,
+    )
+    .unwrap();
+    client.cache_instrument(
+        load_swap_instruments_any()
+            .into_iter()
+            .find(|instrument| instrument.id() == InstrumentId::from("ETH-USDT-SWAP.OKX"))
+            .unwrap(),
+    );
+    let boundary = Timestamp::from_millisecond(1_000).unwrap();
+    let reports = client
+        .request_fill_reports(
+            AccountId::new("OKX-001"),
+            Some(OKXInstrumentType::Swap),
+            None,
+            Some(boundary),
+            Some(boundary),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reports.len(), usize::from(included));
+    if included {
+        assert_eq!(
+            reports[0].ts_event,
+            UnixNanos::from(execution_time * 1_000_000)
+        );
+    }
+    server.abort();
 }
 
 fn load_usdc_spot_instrument() -> (InstrumentAny, OKXInstrument) {

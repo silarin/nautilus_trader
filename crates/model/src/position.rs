@@ -2686,7 +2686,7 @@ mod tests {
         stubs::*,
         types::{
             Currency, Money, Price, Quantity,
-            money::{MONEY_RAW_MAX, MoneyRaw},
+            money::{MONEY_RAW_MAX, MONEY_RAW_MIN, MoneyRaw},
         },
     };
 
@@ -3232,6 +3232,214 @@ mod tests {
             serde_json::to_value(restored).unwrap(),
             serde_json::to_value(position).unwrap()
         );
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy, OrderSide::Sell)]
+    #[case(OrderSide::Sell, OrderSide::Buy)]
+    fn test_fractional_currency_commission_survives_position_round_trip(
+        audusd_sim: CurrencyPair,
+        #[case] opening_side: OrderSide,
+        #[case] closing_side: OrderSide,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let fee = Money::from_decimal_exact(dec!(0.011995693), Currency::USD()).unwrap();
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("EXACT-1"))
+            .order_side(opening_side)
+            .last_qty(Quantity::from(2))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-EXACT"))
+            .commission(fee)
+            .build();
+        let mut position = Position::new(&instrument, opening);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.011995693)
+        );
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("EXACT-2"))
+            .order_side(closing_side)
+            .last_qty(Quantity::from(2))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-EXACT"))
+            .commission(fee)
+            .event_id(UUID4::new())
+            .build();
+        position.apply(&closing);
+        assert!(position.is_closed());
+        assert_eq!(position.commissions(), vec![fee + fee]);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.023991386)
+        );
+        position.apply(&closing);
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.023991386)
+        );
+    }
+
+    #[rstest]
+    #[case(MONEY_RAW_MAX, -1.0)]
+    #[case(MONEY_RAW_MIN, 1.0)]
+    fn test_fractional_currency_commission_retains_pnl_bounds(
+        audusd_sim: CurrencyPair,
+        #[case] raw: MoneyRaw,
+        #[case] commission: f64,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("BOUND-1"))
+            .position_id(PositionId::from("P-BOUND"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let mut closing = opening.clone();
+        closing.trade_id = TradeId::from("BOUND-2");
+        closing.event_id = UUID4::new();
+        closing.order_side = OrderSide::Sell;
+        closing.commission = Some(Money::new(commission, Currency::USD()));
+        let mut position = Position::new(&instrument, opening);
+        position.realized_pnl = Some(Money::from_raw(raw, Currency::USD()));
+        let before = rmp_serde::to_vec_named(&position).unwrap();
+
+        assert!(position.try_apply(&closing).is_err());
+        assert_eq!(rmp_serde::to_vec_named(&position).unwrap(), before);
+    }
+
+    #[rstest]
+    #[case(dec!(0.0), dec!(0.125), dec!(0.13), dec!(-0.005))]
+    #[case(dec!(0.0), dec!(-0.125), dec!(-0.13), dec!(0.005))]
+    #[case(dec!(0.31), dec!(0.125), dec!(0.13), dec!(0.305))]
+    #[case(dec!(-0.31), dec!(-0.125), dec!(-0.13), dec!(-0.305))]
+    #[case(dec!(0.0), dec!(-0.125), dec!(0.13), dec!(-0.255))]
+    #[case(dec!(0.0), dec!(0.125), dec!(-0.13), dec!(0.255))]
+    fn test_realized_pnl_preserves_exact_net_amount(
+        audusd_sim: CurrencyPair,
+        #[case] prior: Decimal,
+        #[case] gross: Decimal,
+        #[case] fee: Decimal,
+        #[case] expected: Decimal,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("EXACT-NET-1"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-EXACT-NET"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let mut closing = opening.clone();
+        closing.trade_id = TradeId::from("EXACT-NET-2");
+        closing.event_id = UUID4::new();
+        closing.order_side = OrderSide::Sell;
+        closing.last_px = Price::from_decimal_dp(Decimal::ONE + gross, 5).unwrap();
+        closing.commission = Some(Money::from_decimal_exact(fee, Currency::USD()).unwrap());
+        let mut position = Position::new(&instrument, opening);
+        position.realized_pnl = Some(Money::from_decimal_exact(prior, Currency::USD()).unwrap());
+
+        position.try_apply(&closing).unwrap();
+        assert!(position.is_closed());
+        assert_eq!(position.realized_pnl.unwrap().as_decimal(), expected);
+    }
+
+    #[rstest]
+    #[case(dec!(0.125), dec!(0.001995693), dec!(0.003100001))]
+    #[case(dec!(-0.125), dec!(-0.001995693), dec!(0.003100001))]
+    fn test_realized_pnl_carries_both_exact_fee_remainders(
+        audusd_sim: CurrencyPair,
+        #[case] gross: Decimal,
+        #[case] prior_remainder: Decimal,
+        #[case] fee_remainder: Decimal,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("REMAINDER-1"))
+            .order_side(OrderSide::Buy)
+            .last_qty(Quantity::from(2))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-REMAINDER"))
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        let prior =
+            Money::from_decimal_exact(dec!(0.31) + prior_remainder, Currency::USD()).unwrap();
+        let fee = Money::from_decimal_exact(dec!(0.13) + fee_remainder, Currency::USD()).unwrap();
+        let mut closing = opening.clone();
+        closing.trade_id = TradeId::from("REMAINDER-2");
+        closing.event_id = UUID4::new();
+        closing.order_side = OrderSide::Sell;
+        closing.last_qty = Quantity::from(1);
+        closing.last_px = Price::from_decimal_dp(Decimal::ONE + gross, 5).unwrap();
+        closing.commission = Some(fee);
+        let mut position = Position::new(&instrument, opening);
+        position.realized_pnl = Some(prior);
+
+        position.try_apply(&closing).unwrap();
+        let expected = prior.as_decimal() + gross - fee.as_decimal();
+        assert_eq!(position.realized_pnl.unwrap().as_decimal(), expected);
+
+        closing.trade_id = TradeId::from("REMAINDER-3");
+        closing.event_id = UUID4::new();
+        closing.last_px = Price::from("1.00000");
+        position.try_apply(&closing).unwrap();
+        assert!(position.is_closed());
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            expected - fee.as_decimal()
+        );
+    }
+
+    #[rstest]
+    #[case(OrderSide::Buy, OrderSide::Sell, "1.12500")]
+    #[case(OrderSide::Sell, OrderSide::Buy, "0.87500")]
+    fn test_fractional_fees_and_exact_pnl_survive_fill_replay(
+        audusd_sim: CurrencyPair,
+        #[case] opening_side: OrderSide,
+        #[case] closing_side: OrderSide,
+        #[case] closing_price: &str,
+    ) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim);
+        let opening = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("ROUND-1"))
+            .order_side(opening_side)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from("1.00000"))
+            .position_id(PositionId::from("P-ROUND-REPLAY"))
+            .commission(Money::from_decimal_exact(dec!(0.011995693), Currency::USD()).unwrap())
+            .build();
+        let closing = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .trade_id(TradeId::from("ROUND-2"))
+            .order_side(closing_side)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from(closing_price))
+            .position_id(PositionId::from("P-ROUND-REPLAY"))
+            .commission(Money::from_decimal_exact(dec!(0.133100001), Currency::USD()).unwrap())
+            .event_id(UUID4::new())
+            .build();
+        let encoded = rmp_serde::to_vec_named(&vec![opening.clone(), closing.clone()]).unwrap();
+        let mut position = Position::new(&instrument, opening);
+        position.apply(&closing);
+        assert!(position.is_closed());
+        assert_eq!(
+            position.realized_pnl.unwrap().as_decimal(),
+            dec!(-0.020095694)
+        );
+        assert_eq!(position.commissions()[0].as_decimal(), dec!(0.145095694));
+        let mut recovered: Vec<OrderFilled> = rmp_serde::from_slice(&encoded).unwrap();
+        let mut replayed = Position::new(&instrument, recovered.remove(0));
+        replayed.apply(&recovered[0]);
+        assert_eq!(replayed.realized_pnl, position.realized_pnl);
+        assert_eq!(replayed.commissions(), position.commissions());
+        replayed.apply(&recovered[0]);
+        assert_eq!(replayed.realized_pnl, position.realized_pnl);
     }
 
     #[rstest]

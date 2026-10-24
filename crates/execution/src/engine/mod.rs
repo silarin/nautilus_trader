@@ -96,10 +96,13 @@ use rust_decimal::Decimal;
 use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
-        check_position_reconciliation, fill_precedes_snapshot_reconciled_position,
+        check_position_reconciliation, fill_precedes_committed_activity,
+        fill_precedes_snapshot_reconciled_position, fills_have_ambiguous_position_order,
         generate_external_order_status_events, generate_reconciliation_order_events,
         generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        generate_reconciliation_order_snapshot_events, inferred_reconciliation_trade_ids,
+        order_fill_evidence_matches, query_fill_history_complete, query_fills_match_cached_history,
+        reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -1110,8 +1113,40 @@ impl ExecutionEngine {
             ExecutionReport::Fill(fill_report) => {
                 self.reconcile_fill_report(fill_report);
             }
+            ExecutionReport::FillQueryRequired(_)
+            | ExecutionReport::IncompleteFill(_)
+            | ExecutionReport::OrderFeeEvidence(_) => {
+                msgbus::publish_any(
+                    MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                    report,
+                );
+            }
+            ExecutionReport::FillEvidence(fill_report) => {
+                msgbus::publish_any(
+                    MessagingSwitchboard::reconciliation_fill_evidence_topic(),
+                    fill_report.as_ref(),
+                );
+            }
             ExecutionReport::OrderWithFills(order_report, fills) => {
                 self.reconcile_order_with_fills(order_report, fills);
+            }
+            ExecutionReport::OrderQueryWithFills(order_report, fills) => {
+                self.handle_order_with_fills(order_report, fills, false);
+            }
+            ExecutionReport::OrderFillEvidence(report, _) => {
+                // Companion trades constrain recovery but never apply fills through this
+                // route. Native status projection requires already committed quantity.
+                self.handle_order_with_fills(report, &[], false);
+            }
+            ExecutionReport::OrderFillConflict(report) => {
+                msgbus::publish_any(
+                    MessagingSwitchboard::reconciliation_raw_order_query_topic(),
+                    &ExecutionReport::OrderFillConflict(report.clone()),
+                );
+                log::error!(
+                    "Contradictory execution evidence for {}",
+                    report.venue_order_id
+                );
             }
             ExecutionReport::Position(position_report) => {
                 self.reconcile_position_report(position_report);
@@ -1136,6 +1171,15 @@ impl ExecutionEngine {
     }
 
     fn handle_order_status_report(&mut self, report: &OrderStatusReport, is_snapshot: bool) {
+        if self.requires_order_query_fills(
+            report.account_id,
+            report.instrument_id,
+            report.client_order_id,
+        ) {
+            self.handle_order_with_fills(report, &[], false);
+            return;
+        }
+
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
             report,
@@ -1536,8 +1580,44 @@ impl ExecutionEngine {
             report,
         );
 
+        if !report.last_qty.is_zero()
+            && self.requires_order_query_fills(
+                report.account_id,
+                report.instrument_id,
+                report.client_order_id,
+            )
+        {
+            msgbus::publish_any(
+                MessagingSwitchboard::reconciliation_fill_evidence_topic(),
+                report,
+            );
+        }
+
         if report.last_qty.is_zero() {
             log::warn!("Skipping zero-quantity fill report: {report}");
+            return;
+        }
+
+        if self.requires_order_query_fills(
+            report.account_id,
+            report.instrument_id,
+            report.client_order_id,
+        ) && !fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), report)
+            && (fills_have_ambiguous_position_order(
+                &self.cache.borrow(),
+                std::slice::from_ref(report),
+                false,
+            ) || fill_precedes_committed_activity(
+                &self.cache.borrow(),
+                report.account_id,
+                report.instrument_id,
+                report.venue_order_id,
+                report.trade_id,
+                report.ts_event,
+                false,
+            ))
+        {
+            log::warn!("Deferring historical fill that crosses committed native accounting");
             return;
         }
 
@@ -1655,6 +1735,48 @@ impl ExecutionEngine {
             .map(|order| order.clone())
     }
 
+    /// Whether an account and instrument require authoritative venue executions for recovery.
+    #[must_use]
+    pub fn requires_order_query_fills(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> bool {
+        if let Some(client_id) =
+            client_order_id.and_then(|id| self.cache.borrow().client_id(&id).copied())
+        {
+            return self
+                .get_client(&client_id)
+                .is_some_and(|client| client.requires_order_query_fills(instrument_id));
+        }
+
+        // Ambiguous source identity cannot relax execution authority. Routing still
+        // requires a unique source; any matching strict client prevents inference.
+        self.clients.values().any(|client| {
+            client.account_id == account_id
+                && client.handles_order_venue(instrument_id.venue)
+                && client.requires_order_query_fills(instrument_id)
+        })
+    }
+
+    /// Resolves the unique native client responsible for authoritative order-fill recovery.
+    #[must_use]
+    pub fn order_query_fill_client(
+        &self,
+        account_id: AccountId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Option<ClientId> {
+        let client_id = client_order_id
+            .and_then(|id| self.cache.borrow().client_id(&id).copied())
+            .or_else(|| self.source_client_id_for_account(account_id, &instrument_id));
+        client_id.filter(|id| {
+            self.get_client(id)
+                .is_some_and(|client| client.requires_order_query_fills(instrument_id))
+        })
+    }
+
     fn client_allows_reconciliation_overfill(&self, order: &OrderAny, report: &FillReport) -> bool {
         let client_id = self
             .cache
@@ -1677,6 +1799,21 @@ impl ExecutionEngine {
     /// Adapters use this to emit ADL / liquidation / settlement events without
     /// losing real fill metadata.
     pub fn reconcile_order_with_fills(&mut self, report: &OrderStatusReport, fills: &[FillReport]) {
+        self.handle_order_with_fills(report, fills, true);
+    }
+
+    fn handle_order_with_fills(
+        &mut self,
+        report: &OrderStatusReport,
+        fills: &[FillReport],
+        is_snapshot: bool,
+    ) {
+        let is_snapshot = is_snapshot
+            && !self.requires_order_query_fills(
+                report.account_id,
+                report.instrument_id,
+                report.client_order_id,
+            );
         msgbus::publish_any(
             MessagingSwitchboard::reconciliation_raw_order_status_report_topic(),
             report,
@@ -1699,6 +1836,84 @@ impl ExecutionEngine {
         let instrument = cache.instrument(&report.instrument_id).cloned();
         drop(cache);
 
+        if !is_snapshot
+            && fills.is_empty()
+            && let Some(order) = order.as_ref()
+        {
+            // Status projection supplies no recovery-completeness authority.
+            // An unfilled submission can learn its venue identity from authoritative
+            // status without inventing executions or replacing a known identity.
+            let unfilled_submission = order.venue_order_id().is_none()
+                && order.filled_qty().is_zero()
+                && report.filled_qty.is_zero()
+                && order.instrument_id() == report.instrument_id
+                && order.account_id() == Some(report.account_id)
+                && report.client_order_id == Some(order.client_order_id())
+                && report.order_side == Some(order.order_side())
+                && self
+                    .cache
+                    .borrow()
+                    .client_order_id(&report.venue_order_id)
+                    .is_none_or(|id| *id == order.client_order_id());
+            if unfilled_submission || order_fill_evidence_matches(order, report, fills) {
+                let events = generate_reconciliation_order_events(
+                    order,
+                    report,
+                    instrument.as_ref(),
+                    self.clock.borrow().timestamp_ns(),
+                );
+
+                for event in &events {
+                    self.handle_event(event);
+                }
+            }
+            return;
+        }
+
+        if !is_snapshot
+            && (order.as_ref().is_some_and(|order| {
+                !query_fills_match_cached_history(order, report, fills)
+                    || order.instrument_id() != report.instrument_id
+                    || report.order_side != Some(order.order_side())
+                    || order
+                        .account_id()
+                        .is_some_and(|account| account != report.account_id)
+            }) || fills.iter().any(|fill| {
+                fill.instrument_id != report.instrument_id
+                    || fill.account_id != report.account_id
+                    || fill.venue_order_id != report.venue_order_id
+                    || Some(fill.order_side) != report.order_side
+                    || fill
+                        .client_order_id
+                        .is_some_and(|id| Some(id) != report.client_order_id)
+            }))
+        {
+            log::warn!("Order query fill identity conflicts with the canonical order");
+            return;
+        }
+
+        if !is_snapshot
+            && (fills_have_ambiguous_position_order(
+                &self.cache.borrow(),
+                fills,
+                query_fill_history_complete(report, fills),
+            ) || fills.iter().any(|fill| {
+                !fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), fill)
+                    && fill_precedes_committed_activity(
+                        &self.cache.borrow(),
+                        fill.account_id,
+                        fill.instrument_id,
+                        fill.venue_order_id,
+                        fill.trade_id,
+                        fill.ts_event,
+                        false,
+                    )
+            }))
+        {
+            log::warn!("Order query recovery would cross committed native accounting");
+            return;
+        }
+
         let Some(instrument) = instrument else {
             log::debug!(
                 "Cannot reconcile bundled report for venue_order_id={}: instrument {} not found",
@@ -1706,7 +1921,8 @@ impl ExecutionEngine {
                 report.instrument_id,
             );
 
-            if fills.is_empty()
+            if is_snapshot
+                && fills.is_empty()
                 && let Some(order) = order
             {
                 let ts_now = self.clock.borrow().timestamp_ns();
@@ -1761,6 +1977,15 @@ impl ExecutionEngine {
             }
         };
 
+        if !is_snapshot
+            && inferred_reconciliation_trade_ids(&order).map_or(true, |ids| !ids.is_empty())
+        {
+            log::warn!(
+                "Order query cannot reconcile authoritative fills over existing inferred executions"
+            );
+            return;
+        }
+
         let client_order_id = order.client_order_id();
 
         for fill in fills {
@@ -1773,7 +1998,9 @@ impl ExecutionEngine {
                 ts_now,
                 self.config.allow_overfills,
             ) {
-                self.handle_event(&event);
+                let apply_position = is_snapshot
+                    || !fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), fill);
+                self.handle_event_with_position_application(&event, apply_position);
             }
 
             // Refresh order after fill to keep filled_qty accurate for the next iteration.
@@ -1788,12 +2015,18 @@ impl ExecutionEngine {
         }
 
         let ts_now = self.clock.borrow().timestamp_ns();
-        let events = generate_reconciliation_order_snapshot_events(
-            &order,
-            report,
-            Some(&instrument),
-            ts_now,
-        );
+        let events = if is_snapshot {
+            generate_reconciliation_order_snapshot_events(&order, report, Some(&instrument), ts_now)
+        } else {
+            // A query cannot infer missing executions or void newer stream fills
+            if order.filled_qty() < report.filled_qty {
+                log::warn!(
+                    "Order query remains unresolved for {client_order_id}: authoritative fills did not account for the reported quantity"
+                );
+                return;
+            }
+            generate_reconciliation_order_events(&order, report, Some(&instrument), ts_now)
+        };
 
         for event in &events {
             self.handle_event(event);
@@ -3110,6 +3343,27 @@ impl ExecutionEngine {
             return false;
         }
 
+        if apply_position
+            && let OrderEventAny::Filled(fill) = event
+            && self.requires_order_query_fills(
+                fill.account_id,
+                fill.instrument_id,
+                Some(fill.client_order_id),
+            )
+            && fill_precedes_committed_activity(
+                &self.cache.borrow(),
+                fill.account_id,
+                fill.instrument_id,
+                fill.venue_order_id,
+                fill.trade_id,
+                fill.ts_event,
+                !fill.reconciliation,
+            )
+        {
+            log::warn!("Declining fill that crosses committed native accounting");
+            return false;
+        }
+
         self.event_count += 1;
 
         if self.config.debug {
@@ -3260,6 +3514,11 @@ impl ExecutionEngine {
                 let position_events = if apply_position {
                     self.handle_order_fill(&order, fill, oms_type, restatement)
                 } else {
+                    // Persist the native projection decision before committed publication.
+                    msgbus::publish_any(
+                        switchboard::get_order_fill_order_only_topic(order.instrument_id()),
+                        &event,
+                    );
                     Vec::new()
                 };
 

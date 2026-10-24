@@ -4228,7 +4228,11 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_balances_returns_recalculated_balance_for_cash_account() {
+    #[case("20 USD")]
+    #[case("0.011995693 USD")]
+    #[case("-0.011995693 USD")]
+    fn test_update_balances_returns_recalculated_balance_for_cash_account(#[case] fee: &str) {
+        let fee = Money::from_str_exact(fee).unwrap();
         let usd = Currency::USD();
         let account_state = AccountState::new(
             AccountId::new("SIM-001"),
@@ -4281,7 +4285,7 @@ mod tests {
             .ts_event(UnixNanos::from(1))
             .ts_init(UnixNanos::from(1))
             .position_id(PositionId::new("P-001"))
-            .commission(Money::new(20.0, usd))
+            .commission(fee)
             .build();
         let position = Position::new(
             &InstrumentAny::CurrencyPair(instrument.clone()),
@@ -4299,11 +4303,11 @@ mod tests {
         );
         let state = state.unwrap();
 
-        // Buy 100k at 0.80 → 80,000 USD cost, 20 USD commission, expect 919,980 USD
-        let expected = Money::new(919_980.0, usd);
+        let expected = Money::new(920_000.0, usd) - fee;
 
         match updated {
             AccountAny::Cash(cash) => {
+                assert_eq!(cash.commission(&usd), Some(fee));
                 assert_eq!(cash.balance_total(Some(usd)), Some(expected));
                 assert_eq!(cash.balance_free(Some(usd)), Some(expected));
             }
@@ -4829,7 +4833,11 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_balance_multi_currency_market_debit_keeps_locked_balance() {
+    #[case("20 USD")]
+    #[case("0.011995693 USD")]
+    #[case("-0.011995693 USD")]
+    fn test_update_balance_multi_currency_market_debit_keeps_locked_balance(#[case] fee: &str) {
+        let fee = Money::from_str_exact(fee).unwrap();
         let usd = Currency::USD();
         let account = multi_currency_cash_account_with_usd_locked(1_000.0, 200.0);
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
@@ -4844,7 +4852,7 @@ mod tests {
         let fill = OrderFilledSpec::builder()
             .instrument_id(instrument.id())
             .order_type(OrderType::Market)
-            .commission(Money::new(20.0, usd))
+            .commission(fee)
             .build();
         let mut account = AccountAny::Cash(account);
         let mut pnls = vec![Money::new(-100.0, usd)];
@@ -4855,10 +4863,16 @@ mod tests {
 
         match account {
             AccountAny::Cash(cash) => {
-                assert_eq!(cash.balance_total(Some(usd)), Some(Money::new(880.0, usd)));
+                assert_eq!(
+                    cash.balance_total(Some(usd)),
+                    Some(Money::new(900.0, usd) - fee)
+                );
                 assert_eq!(cash.balance_locked(Some(usd)), Some(Money::new(200.0, usd)));
-                assert_eq!(cash.balance_free(Some(usd)), Some(Money::new(680.0, usd)));
-                assert_eq!(cash.commission(&usd), Some(Money::new(20.0, usd)));
+                assert_eq!(
+                    cash.balance_free(Some(usd)),
+                    Some(Money::new(700.0, usd) - fee)
+                );
+                assert_eq!(cash.commission(&usd), Some(fee));
             }
             _ => panic!("Expected CashAccount"),
         }
@@ -5226,7 +5240,11 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_balance_multi_currency_commission_preserves_invariant_with_large_locked() {
+    #[case("0.00000001")]
+    #[case("0.011995693")]
+    fn test_update_balance_multi_currency_commission_preserves_invariant_with_large_locked(
+        #[case] fee: &str,
+    ) {
         // Regression for issue #4165: the commission branch had the same f64 round-trip drift.
         let usdt = Currency::USDT();
         let (mut account, total, locked) = large_locked_usdt_margin_account();
@@ -5237,7 +5255,7 @@ mod tests {
         // This commission reproduces the exact panic values from issue #4165: the old
         // Decimal-then-f64 round-trips yielded total=99999997.91829666, free=99999965.05864664.
         let commission =
-            Money::from_decimal(Decimal::from_str_exact("0.00000001").unwrap(), usdt).unwrap();
+            Money::from_decimal_exact(Decimal::from_str_exact(fee).unwrap(), usdt).unwrap();
         let fill = OrderFilledSpec::builder().commission(commission).build();
 
         // No PnL entries: only the commission branch runs.
@@ -5281,7 +5299,7 @@ mod tests {
         let manager = AccountsManager::new(clock, cache);
 
         let fill = OrderFilledSpec::builder()
-            .commission(Money::new(-1.0, usd))
+            .commission(Money::from_str_exact("-0.011995693 USD").unwrap())
             .build();
         let mut pnls: [Money; 0] = [];
         manager
@@ -5292,10 +5310,19 @@ mod tests {
             panic!("Expected CashAccount");
         };
         let balance = cash.balance(Some(usd)).expect("USD rebate balance");
-        assert_eq!(balance.total, Money::new(1.0, usd));
+        assert_eq!(
+            balance.total,
+            Money::from_str_exact("0.011995693 USD").unwrap()
+        );
         assert_eq!(balance.locked, Money::zero(usd));
-        assert_eq!(balance.free, Money::new(1.0, usd));
-        assert_eq!(cash.commission(&usd), Some(Money::new(-1.0, usd)));
+        assert_eq!(
+            balance.free,
+            Money::from_str_exact("0.011995693 USD").unwrap()
+        );
+        assert_eq!(
+            cash.commission(&usd),
+            Some(Money::from_str_exact("-0.011995693 USD").unwrap())
+        );
     }
 
     fn build_margin_account_usd(balance: f64) -> MarginAccount {

@@ -482,13 +482,14 @@ impl OrderEvent for OrderFilled {
 mod tests {
     use nautilus_core::UnixNanos;
     use rstest::rstest;
+    use ruint::aliases::U256;
 
     use super::*;
     use crate::{
         enums::OrderSide,
         events::order::stubs::*,
         identifiers::PositionId,
-        types::{Currency, Money, Price, Quantity},
+        types::{Currency, Money, Price, Quantity, money::MoneyRaw},
     };
 
     fn create_test_order_filled() -> OrderFilled {
@@ -623,6 +624,110 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             "position input exceeds exact Decimal representation"
+        );
+    }
+
+    #[rstest]
+    #[case("0.006", "0.0054", "0.0006")]
+    #[case("-0.006", "-0.0054", "-0.0006")]
+    #[case("0.01", "0.009", "0.001")]
+    #[case("0", "0", "0")]
+    fn test_position_flip_retains_exact_commission(
+        #[case] total: &str,
+        #[case] closing_fee: &str,
+        #[case] opening_fee: &str,
+    ) {
+        let exact = |value: &str| {
+            Money::from_decimal_exact(value.parse().unwrap(), Currency::USD()).unwrap()
+        };
+        let (total, closing_fee, opening_fee) =
+            (exact(total), exact(closing_fee), exact(opening_fee));
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from("2.0");
+        fill.commission = Some(total);
+        let (closing, opening) = fill
+            .split_for_position_flip(Quantity::from("1.8"), None, UUID4::new())
+            .unwrap();
+        assert_eq!(closing.commission, Some(closing_fee));
+        assert_eq!(opening.commission, Some(opening_fee));
+        assert_eq!(closing_fee + opening_fee, total);
+
+        for fragment in [closing, opening] {
+            let encoded = rmp_serde::to_vec_named(&fragment).unwrap();
+            let restored: OrderFilled = rmp_serde::from_slice(&encoded).unwrap();
+            assert_eq!(restored, fragment);
+        }
+    }
+
+    #[rstest]
+    fn test_position_flip_allocates_indivisible_native_units_without_overflow(
+        #[values(1, -1)] sign: MoneyRaw,
+        #[values(false, true)] large_amounts: bool,
+    ) {
+        use crate::types::{
+            fixed::FIXED_PRECISION,
+            money::MONEY_RAW_MAX,
+            quantity::{QUANTITY_RAW_MAX, QuantityRaw},
+        };
+        let max_money = MoneyRaw::try_from(Decimal::MAX.mantissa()).unwrap_or(MONEY_RAW_MAX);
+        let max_quantity =
+            QuantityRaw::try_from(Decimal::MAX.mantissa()).unwrap_or(QUANTITY_RAW_MAX);
+        let total = Money::from_raw(
+            sign * if large_amounts { max_money } else { 1 },
+            Currency::USD(),
+        );
+        let denominator = if large_amounts { max_quantity } else { 3 };
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from_raw(denominator, FIXED_PRECISION);
+        fill.commission = Some(total);
+        let (closing, opening) = fill
+            .split_for_position_flip(
+                Quantity::from_raw(denominator - 1, FIXED_PRECISION),
+                None,
+                UUID4::new(),
+            )
+            .unwrap();
+        let closing = closing.commission.unwrap();
+        let opening = opening.commission.unwrap();
+        assert_eq!(closing + opening, total);
+        assert!(closing.raw() == 0 || closing.raw().signum() == sign);
+        assert!(opening.raw() == 0 || opening.raw().signum() == sign);
+        let allocated = U256::from(closing.raw().unsigned_abs()) * U256::from(denominator);
+        let ideal = U256::from(total.raw().unsigned_abs()) * U256::from(denominator - 1);
+        assert!(allocated <= ideal);
+        assert!(ideal - allocated < U256::from(denominator));
+    }
+
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn test_position_flip_rejects_inputs_outside_exact_accounting_range(
+        #[values(1, -1)] sign: MoneyRaw,
+        #[values(false, true)] oversized_fee: bool,
+    ) {
+        use crate::types::fixed::FIXED_PRECISION;
+
+        let outside_decimal = Decimal::MAX.mantissa() + 1;
+        let mut fill = create_test_order_filled();
+        fill.last_qty = Quantity::from_raw(
+            if oversized_fee {
+                3
+            } else {
+                outside_decimal as u128
+            },
+            FIXED_PRECISION,
+        );
+        fill.commission = Some(Money::from_raw(
+            sign * if oversized_fee { outside_decimal } else { 1 },
+            Currency::USD(),
+        ));
+
+        assert!(
+            fill.split_for_position_flip(
+                Quantity::from_raw(1, FIXED_PRECISION),
+                None,
+                UUID4::new()
+            )
+            .is_err()
         );
     }
 

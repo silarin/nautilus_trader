@@ -902,10 +902,18 @@ impl ClientOutput {
                 event.trader_id == trader_id && event.account_id.is_none_or(|id| id == account_id)
             }),
             ExecutionEvent::Report(report) => match report {
-                ExecutionReport::Order(report) => report.account_id == account_id,
-                ExecutionReport::Fill(report) => report.account_id == account_id,
+                ExecutionReport::Order(report) | ExecutionReport::OrderFillConflict(report) => {
+                    report.account_id == account_id
+                }
+                ExecutionReport::Fill(report)
+                | ExecutionReport::FillEvidence(report)
+                | ExecutionReport::FillQueryRequired(report) => report.account_id == account_id,
+                ExecutionReport::IncompleteFill(report) => report.account_id == account_id,
+                ExecutionReport::OrderFeeEvidence(report) => report.account_id == account_id,
                 ExecutionReport::Position(report) => report.account_id == account_id,
-                ExecutionReport::OrderWithFills(report, fills) => {
+                ExecutionReport::OrderWithFills(report, fills)
+                | ExecutionReport::OrderQueryWithFills(report, fills)
+                | ExecutionReport::OrderFillEvidence(report, fills) => {
                     report.account_id == account_id
                         && fills.iter().all(|fill| fill.account_id == account_id)
                 }

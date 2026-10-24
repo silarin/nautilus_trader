@@ -103,6 +103,7 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-event-store = { workspace = true }
 nautilus-live = { workspace = true, features = ["node", "test-support"] }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
@@ -113,6 +114,7 @@ axum = { workspace = true }
 criterion = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 

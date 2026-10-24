@@ -47,6 +47,7 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
+mod fees;
 mod ids;
 mod orders;
 mod positions;
@@ -58,23 +59,31 @@ mod proptests;
 #[cfg(test)]
 mod tests;
 
+pub use fees::{
+    FeeEvidenceState, commission_history_has_authority, committed_commission_fills,
+    evaluate_order_fee_evidence, order_fee_recovery_complete,
+};
 pub use ids::{
     create_inferred_reconciliation_trade_id, create_position_reconciliation_venue_order_id,
     inferred_reconciliation_trade_ids, is_inferred_reconciliation_trade_id_format,
 };
 pub use orders::{
     create_incremental_inferred_fill, create_inferred_fill_for_qty, create_reconciliation_rejected,
-    create_reconciliation_triggered, generate_external_order_status_events,
+    create_reconciliation_triggered, fill_evidence_is_committed, fill_evidence_matches,
+    fill_evidence_matches_with_order, generate_external_order_status_events,
     generate_external_order_status_events_with_commission, generate_reconciliation_order_events,
     generate_reconciliation_order_pre_fill_events, generate_reconciliation_order_snapshot_events,
     generate_reconciliation_order_snapshot_events_with_commission,
-    incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
+    incomplete_fill_stream_recovery_complete, incremental_inferred_fill_price_and_liquidity,
+    inferred_fill_price_and_liquidity, order_fill_evidence_matches, query_fill_evidence_matches,
+    query_fill_history_complete, query_fill_recovery_complete, query_fills_match_cached_history,
     reconcile_fill_report, reconcile_order_report, reconcile_order_report_with_commission,
-    should_reconciliation_update,
+    should_reconciliation_update, stream_fill_recovery_complete,
 };
 pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,
-    fill_precedes_snapshot_reconciled_position, position_prices_match,
+    fill_precedes_committed_activity, fill_precedes_snapshot_reconciled_position,
+    fills_have_ambiguous_position_order, position_prices_match,
     process_mass_status_for_reconciliation,
     process_mass_status_for_reconciliation_without_synthetic_reports,
 };
